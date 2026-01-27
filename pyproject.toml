@@ -31,6 +31,7 @@ dependencies = [
     "libtmux>=0.28.0",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
+    "mcp>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +45,8 @@ dev = [
 
 [project.scripts]
 agentic = "agentic.cli:main"
+agentic-mcp = "agentic.mcp_server:main"
+agentic-worker-mcp = "agentic.worker_mcp:main"
 
 [project.urls]
 Homepage = "https://github.com/agentic-cli/agentic-tmux"
@@ -52,6 +55,9 @@ Repository = "https://github.com/agentic-cli/agentic-tmux"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentic"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"agentic/data" = "agentic/data"
 
 [tool.black]
 line-length = 100

@@ -6,9 +6,10 @@ import shutil
 from pathlib import Path
 
 
-# Get the hooks directory from this package
-PACKAGE_HOOKS_DIR = Path(__file__).parent.parent / "hooks"
-PACKAGE_SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
+# Get the hooks directory from package data
+_PACKAGE_DIR = Path(__file__).parent.parent  # agentic/
+PACKAGE_HOOKS_DIR = _PACKAGE_DIR / "data" / "hooks"
+PACKAGE_SCRIPTS_DIR = _PACKAGE_DIR / "data" / "scripts"
 
 
 def install_hooks(repo_path: Path, agent_type: str = "worker") -> None:
