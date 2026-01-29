@@ -193,9 +193,9 @@ class TmuxManager:
         if initial_task:
             # Clean the task text
             clean_task = initial_task.replace('\n', ' ').strip()
-            # Limit length to avoid issues  
-            if len(clean_task) > 1500:
-                clean_task = clean_task[:1500] + "..."
+            # Limit length to avoid shell issues (shells typically handle 100K+ chars)
+            if len(clean_task) > 50000:
+                clean_task = clean_task[:50000] + "..."
             
             # Debug: Log what we're sending
             from pathlib import Path
@@ -228,7 +228,8 @@ class TmuxManager:
                             "env": {
                                 "AGENTIC_SESSION_ID": session_id,
                                 "AGENTIC_AGENT_ID": agent.id,
-                            }
+                            },
+                            "timeout": 600000,  # 10 minutes - for long polling operations
                         }
                     }
                 }

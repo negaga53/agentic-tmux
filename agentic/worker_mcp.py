@@ -18,12 +18,23 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from agentic.redis_client import get_client
+
+
+# Debug logging
+DEBUG_LOG = Path.home() / ".config" / "agentic" / "worker_mcp_debug.log"
+DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+def _log_debug(msg: str) -> None:
+    """Write debug message to log file."""
+    with open(DEBUG_LOG, "a") as f:
+        f.write(f"{time.time()}: {msg}\n")
 
 
 def get_storage():
@@ -43,7 +54,9 @@ def get_session_info() -> tuple[str | None, str | None]:
 
 
 # Create the worker MCP server
+_log_debug("Worker MCP server initializing...")
 worker_mcp = FastMCP("Agentic Worker")
+_log_debug("Worker MCP server created")
 
 
 @worker_mcp.tool()
@@ -69,10 +82,11 @@ def send_to_agent(
     
     storage = get_storage()
     
-    # Verify target agent exists
-    target_agent = storage.get_agent(session_id, agent_id)
-    if not target_agent:
-        return {"error": f"Agent {agent_id} not found in session"}
+    # Verify target agent exists (orchestrator is a special case)
+    if agent_id != "orchestrator":
+        target_agent = storage.get_agent(session_id, agent_id)
+        if not target_agent:
+            return {"error": f"Agent {agent_id} not found in session"}
     
     # Send the message
     msg_id = storage.send_agent_message(
@@ -94,7 +108,7 @@ def send_to_agent(
 @worker_mcp.tool()
 def receive_message(
     timeout: int = Field(
-        default=30,
+        default=60,
         description="Seconds to wait for a message (0 for non-blocking)",
     ),
 ) -> dict[str, Any]:
@@ -104,8 +118,11 @@ def receive_message(
     Messages are received in order (FIFO). If no message is available,
     waits up to `timeout` seconds. Use timeout=0 for non-blocking check.
     
+    Also checks if the session has been terminated via push_done_to_all.
+    If session is done, returns a termination signal.
+    
     Example:
-        receive_message(timeout=30)  # Wait up to 30 seconds
+        receive_message(timeout=60)  # Wait up to 60 seconds
         receive_message(timeout=0)   # Check and return immediately
     """
     session_id, agent_id = get_session_info()
@@ -117,10 +134,27 @@ def receive_message(
     
     storage = get_storage()
     
+    # Check if session has been marked done (via push_done_to_all or stop_session)
+    if storage.is_session_done(session_id):
+        return {
+            "status": "session_terminated",
+            "agent_id": agent_id,
+            "message": "TERMINATE",
+            "reason": "Session has been marked as done by orchestrator",
+        }
+    
     # Try to receive a message
     msg = storage.receive_agent_message(session_id, agent_id, timeout=timeout)
     
     if not msg:
+        # Check session done status again after waiting
+        if storage.is_session_done(session_id):
+            return {
+                "status": "session_terminated",
+                "agent_id": agent_id,
+                "message": "TERMINATE",
+                "reason": "Session has been marked as done by orchestrator",
+            }
         return {
             "status": "no_message",
             "agent_id": agent_id,
@@ -200,13 +234,18 @@ def list_agents() -> dict[str, Any]:
     
     Use this to discover which agents are available to communicate with.
     """
+    _log_debug("list_agents: START")
     session_id, agent_id = get_session_info()
     
     if not session_id:
+        _log_debug("list_agents: NO SESSION")
         return {"error": "No active session (AGENTIC_SESSION_ID not set)"}
     
+    _log_debug(f"list_agents: getting storage for session={session_id}")
     storage = get_storage()
+    _log_debug("list_agents: got storage, querying agents")
     agents = storage.get_all_agents(session_id)
+    _log_debug(f"list_agents: DONE, found {len(agents)} agents")
     
     return {
         "session_id": session_id,

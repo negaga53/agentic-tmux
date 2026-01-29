@@ -336,17 +336,6 @@ def export(output: str):
     console.print(f"[green]✓[/green] Exported to {output}")
 
 
-@main.command()
-@click.option("--repo", "-r", default=".", help="Repository path")
-def init(repo: str):
-    """Initialize hooks in a repository."""
-    from agentic.hooks.install import install_hooks
-    
-    repo_path = Path(repo).resolve()
-    install_hooks(repo_path)
-    console.print(f"[green]✓[/green] Hooks installed in {repo_path / '.github' / 'hooks'}")
-
-
 # =============================================================================
 # Inter-agent messaging commands (for use by workers)
 # =============================================================================

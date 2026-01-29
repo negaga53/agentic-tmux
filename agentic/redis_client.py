@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Generator
+
+# Set up debug logging for inter-agent communication
+DEBUG_LOG = Path.home() / ".config" / "agentic" / "sqlite_debug.log"
+DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+def _log_debug(msg: str) -> None:
+    """Write debug message to log file."""
+    with open(DEBUG_LOG, "a") as f:
+        f.write(f"{time.time()}: {msg}\n")
 
 import redis
 import redis.asyncio as aioredis
@@ -131,9 +141,29 @@ class SQLiteAgenticClient:
         try:
             yield cursor
             conn.commit()
+        except sqlite3.OperationalError as e:
+            conn.rollback()
+            raise
         except Exception:
             conn.rollback()
             raise
+
+    def _execute_with_retry(
+        self, 
+        operation: callable, 
+        max_retries: int = 5
+    ):
+        """Execute a database operation with retry on busy."""
+        for attempt in range(max_retries):
+            try:
+                return operation()
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    # Exponential backoff: 0.1s, 0.2s, 0.4s, 0.8s, 1.6s
+                    time.sleep(0.1 * (2 ** attempt))
+                    continue
+                raise
+        raise RuntimeError("Max retries exceeded")
 
     def _init_db(self) -> None:
         """Initialize database schema."""
@@ -496,6 +526,7 @@ class SQLiteAgenticClient:
     ) -> str:
         """Send a message from one agent to another. Returns message ID."""
         import random
+        _log_debug(f"send_agent_message: {from_agent} -> {to_agent}, msg_len={len(message)}")
         key = RedisKeys.agent_messages(session_id, to_agent)
         msg_id = f"{int(time.time() * 1000)}-{from_agent}"
         data = {
@@ -509,6 +540,7 @@ class SQLiteAgenticClient:
         max_retries = 10
         for attempt in range(max_retries):
             try:
+                _log_debug(f"send_agent_message attempt {attempt + 1}")
                 with self._transaction() as cur:
                     cur.execute("SELECT MAX(idx) as max_idx FROM queues WHERE key = ?", (key,))
                     row = cur.fetchone()
@@ -518,11 +550,14 @@ class SQLiteAgenticClient:
                         "INSERT INTO queues (key, idx, value) VALUES (?, ?, ?)",
                         (key, next_idx, json.dumps(data)),
                     )
+                _log_debug(f"send_agent_message SUCCESS: {msg_id}")
                 return msg_id
-            except sqlite3.IntegrityError:
+            except (sqlite3.IntegrityError, sqlite3.OperationalError) as e:
+                _log_debug(f"send_agent_message ERROR attempt {attempt + 1}: {e}")
                 if attempt == max_retries - 1:
                     raise
-                time.sleep(0.05 * (2 ** attempt))
+                # Exponential backoff
+                time.sleep(0.1 * (2 ** attempt))
                 continue
         return msg_id
 
@@ -530,23 +565,40 @@ class SQLiteAgenticClient:
         self, session_id: str, agent_id: str, timeout: int = 0
     ) -> dict | None:
         """Receive the next message for an agent. Non-blocking if timeout=0."""
+        _log_debug(f"receive_agent_message: agent={agent_id}, timeout={timeout}")
         key = RedisKeys.agent_messages(session_id, agent_id)
         start_time = time.time()
+        retry_count = 0
+        max_retries = 5
+        poll_count = 0
         
         while True:
-            with self._transaction() as cur:
-                cur.execute(
-                    "SELECT idx, value FROM queues WHERE key = ? ORDER BY idx LIMIT 1",
-                    (key,),
-                )
-                row = cur.fetchone()
-                if row:
-                    # Remove the message from queue
-                    cur.execute("DELETE FROM queues WHERE key = ? AND idx = ?", (key, row["idx"]))
-                    return json.loads(row["value"])
+            poll_count += 1
+            try:
+                with self._transaction() as cur:
+                    cur.execute(
+                        "SELECT idx, value FROM queues WHERE key = ? ORDER BY idx LIMIT 1",
+                        (key,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        # Remove the message from queue
+                        cur.execute("DELETE FROM queues WHERE key = ? AND idx = ?", (key, row["idx"]))
+                        msg = json.loads(row["value"])
+                        _log_debug(f"receive_agent_message: GOT message from {msg.get('from')}")
+                        return msg
+                    retry_count = 0  # Reset on successful query
+            except sqlite3.OperationalError as e:
+                _log_debug(f"receive_agent_message: OperationalError {e}, retry={retry_count}")
+                if "database is locked" in str(e) and retry_count < max_retries:
+                    retry_count += 1
+                    time.sleep(0.1 * (2 ** retry_count))
+                    continue
+                raise
             
             # If no timeout or timeout expired, return None
             if timeout == 0 or (time.time() - start_time) >= timeout:
+                _log_debug(f"receive_agent_message: TIMEOUT after {poll_count} polls")
                 return None
             
             # Poll with small delay

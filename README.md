@@ -17,7 +17,6 @@ Agentic TMUX allows you to spawn multiple AI coding agents (GitHub Copilot CLI, 
 
 - **Multi-agent orchestration** - Spawn and coordinate multiple AI agents
 - **Interactive planning** - LLM generates task DAG, you approve/modify
-- **File scope enforcement** - Pre-hooks validate file access per agent
 - **Real-time communication** - Message queues for agent-to-agent messaging
 - **Deadlock prevention** - Orchestrator daemon monitors for circular waits
 - **Session resume** - Reuse existing agents for new prompts
@@ -103,7 +102,6 @@ The CLI is primarily for debugging and monitoring. Use MCP for orchestration.
 | `agentic stop` | Stop the current session |
 | `agentic clear` | Clear all workers |
 | `agentic export` | Export session transcript |
-| `agentic init` | Initialize hooks in current repo |
 
 ## MCP Server
 
@@ -163,7 +161,6 @@ Add to your Claude Desktop config (`~/.config/claude/claude_desktop_config.json`
 | `get_status` | Get status of all agents and tasks |
 | `get_agent_logs` | Get logs for a specific agent |
 | `clear_agents` | Clear all workers, keep session |
-| `init_hooks` | Initialize hooks in a repository |
 
 ### MCP Resources
 
@@ -222,20 +219,6 @@ resume_session()  → Returns session state and active agents
 
 > **Note:** Redis environment variables are only used if Redis is available. Without Redis, data is stored in-memory.
 
-### Hooks
-
-Agentic uses hooks to intercept CLI events. Install hooks in your repo:
-
-```bash
-agentic init
-```
-
-This creates `.github/hooks/` with:
-- `sessionStart.json` - Agent registration
-- `preToolUse.json` - File scope validation
-- `postToolUse.json` - Action logging
-- `sessionEnd.json` - Cleanup
-
 ## Architecture
 
 ```
@@ -260,8 +243,7 @@ This creates `.github/hooks/` with:
 │  ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐       │
 │  │   ADMIN PANE    │   │  WORKER PANE 1  │   │  WORKER PANE 2  │  ...  │
 │  │                 │   │                 │   │                 │       │
-│  │  copilot     │   │  copilot     │   │  copilot     │       │
-│  │  + admin hooks  │   │  + worker hooks │   │  + worker hooks │       │
+│  │  copilot        │   │  copilot        │   │  copilot        │       │
 │  └────────┬────────┘   └────────┬────────┘   └────────┬────────┘       │
 │           │                     │                     │                 │
 └───────────┼─────────────────────┼─────────────────────┼─────────────────┘
@@ -326,11 +308,10 @@ This creates `.github/hooks/` with:
 Agents communicate via Redis queues. To send a task to another agent:
 
 ```bash
-# From within a hook or script
 redis-cli LPUSH agent:$SESSION_ID:W2:queue '{"task":"review changes","from":"W1","files":["src/auth/login.ts"]}'
 ```
 
-Agents poll their queues and process tasks sequentially. The `postToolUse` hook automatically checks for pending tasks.
+Agents poll their queues and process tasks sequentially.
 
 ## Deadlock Prevention
 

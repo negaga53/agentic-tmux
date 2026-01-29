@@ -88,7 +88,6 @@ mcp = FastMCP("Agentic TMUX")
 def _start_session_internal(
     working_dir: str,
     cli_command: str = "copilot -i",
-    auto_init_hooks: bool = True,
     tmux_session: str | None = None,
 ) -> dict[str, Any]:
     """Internal function to start a session."""
@@ -150,17 +149,7 @@ def _start_session_internal(
     
     storage.create_session(session)
     save_current_session_id(session.id)
-    
-    # Auto-install hooks if enabled
-    hooks_status = None
-    if auto_init_hooks:
-        try:
-            from agentic.hooks.install import install_hooks
-            install_hooks(Path(working_dir))
-            hooks_status = "installed"
-        except Exception as e:
-            hooks_status = f"failed: {e}"
-    
+
     # Create tmux session with admin pane (use configured session name)
     tmux = TmuxManager(session_name=tmux_session, use_current_session=False)
     admin_pane_id = tmux.create_admin_pane(working_dir)
@@ -178,17 +167,13 @@ def _start_session_internal(
     if pid:
         PID_FILE.write_text(str(pid))
     
-    result = {
+    return {
         "session_id": session.id,
         "status": "started",
         "working_directory": working_dir,
         "cli_command": cli_command,
         "orchestrator_pid": pid,
     }
-    if hooks_status:
-        result["hooks"] = hooks_status
-    
-    return result
 
 
 @mcp.tool()
@@ -218,14 +203,14 @@ def start_session(
 
 @mcp.tool()
 def stop_session(
-    kill_panes: bool = Field(default=True, description="Kill worker tmux panes"),
+    kill_panes: bool = Field(default=False, description="Kill worker tmux panes (default: keep them for review)"),
     clear_data: bool = Field(default=True, description="Clear session data from database"),
 ) -> dict[str, Any]:
     """
     Stop the current agentic session completely.
     
-    By default, kills all worker panes and clears session data.
-    Use this to clean up before starting a fresh session.
+    By default, keeps worker panes alive so you can review the conversations.
+    Set kill_panes=True to clean them up.
     """
     session_id = get_current_session_id()
     if not session_id:
@@ -589,27 +574,30 @@ You are agent **{agent_id}**. Other agents in this session: {agents_list}
 
 You have MCP tools for inter-agent communication:
 
+- **list_agents()** - List all agents in this session (call this first!)
 - **send_to_agent(agent_id, message)** - Send a message to another agent (or "orchestrator")
-- **receive_message(timeout=30)** - Wait for and receive the next message
+- **receive_message(timeout=300)** - Wait for and receive the next message
 - **check_messages()** - Check if there are pending messages (non-blocking)
-- **list_agents()** - List all agents in this session
 - **broadcast_message(message)** - Send to all agents
 
-**CRITICAL: MESSAGE POLLING LOOP**
-You MUST keep polling for messages until your task terminates:
-1. Call `receive_message(timeout=60)` to wait for messages
-2. If `status` is "received", process the message and respond via `send_to_agent`
-3. If `status` is "no_message", call `receive_message` again immediately
-4. KEEP CALLING `receive_message` - do NOT stop polling until you receive a termination message
-5. Do NOT wait for user input - stay in the polling loop
+**WORKFLOW:**
+1. Call `list_agents()` to discover available agents
+2. Execute your initial task
+3. Send final results to orchestrator via `send_to_agent(agent_id="orchestrator", message="...")`
+4. Enter polling loop: keep calling `receive_message(timeout=300)` for follow-up instructions
 
-To report results to the orchestrator, use: `send_to_agent(agent_id="orchestrator", message="...")`
+**POLLING LOOP - DO NOT EXIT:**
+- If `status` is "received": process message, respond, then poll again
+- If `status` is "no_message": poll again immediately - DO NOT EXIT
+- If `status` is "session_terminated": exit gracefully
+- If message contains "TERMINATE": exit gracefully
+- NEVER end your turn without an explicit termination signal
 """
 
 
 @mcp.tool()
 def spawn_agent(
-    role: str = Field(description="Role description for the agent (used as initial prompt)"),
+    role: str = Field(description="Full task description for the agent (used as initial prompt)"),
     scope_patterns: list[str] = Field(
         default=["**/*"],
         description="File patterns the agent can access",
@@ -636,16 +624,26 @@ def spawn_agent(
     ),
 ) -> dict[str, Any]:
     """
-    Spawn a single new agent in a tmux pane.
+    Spawn a single new agent in a tmux pane with its initial task.
     
-    The agent starts with the `role` as its initial prompt (or `initial_task` if provided).
-    By default, adds inter-agent communication MCP tools (send_to_agent, receive_message, etc.).
+    The 'role' parameter should include the FULL task description - not just a role name.
+    The agent will begin executing this task immediately upon startup.
     
-    The role should contain the full system prompt/instructions for the agent.
+    WORKFLOW: After spawning all agents, you MUST call receive_message_from_agents()
+    to collect their results. Workers send results via send_to_agent("orchestrator", ...).
+    
+    Example role: "Analyze all Python files in src/ for security vulnerabilities,
+    then send a JSON report to the orchestrator via send_to_agent."
     """
     session_id = get_current_session_id()
+    
+    # Auto-start session if none exists
     if not session_id:
-        return {"error": "No active session"}
+        working_dir = os.getcwd()
+        start_result = _start_session_internal(working_dir, "copilot -i")
+        if "error" in start_result:
+            return {"error": f"Failed to auto-start session: {start_result['error']}"}
+        session_id = start_result["session_id"]
     
     redis = get_redis_client()
     session = redis.get_session(session_id)
@@ -694,6 +692,7 @@ def spawn_agent(
             "patterns": agent.scope.patterns,
             "read_only": agent.scope.read_only,
         },
+        "next_step": "Agent is starting. Call receive_message_from_agents() to wait for results.",
     }
     
     # Wait for agent to be ready if requested
@@ -746,8 +745,11 @@ def _wait_for_agent_ready(
             "started",
             "initialized",
             "waiting for input",
-            ">",  # Common prompt character
+            ">",  # ASCII prompt character
+            "❯",  # Unicode prompt (Copilot CLI uses this)
             "copilot",  # CLI name
+            "mcp",  # MCP servers indicator
+            "configured",  # "Configured MCP servers"
         ]
         
         # If output changed and has any indicator, consider ready
@@ -782,67 +784,6 @@ def _wait_for_agent_ready(
 
 
 @mcp.tool()
-def send_task(
-    agent_id: str = Field(description="ID of the agent to send the task to"),
-    task_description: str = Field(description="Description of the task"),
-    files: list[str] = Field(
-        default=[],
-        description="List of files relevant to the task",
-    ),
-    force: bool = Field(
-        default=False,
-        description="Force sending even if a task is already running or queued",
-    ),
-) -> dict[str, Any]:
-    """
-    Send a task to a specific agent.
-    
-    By default, will not send if the agent already has a running task or queued tasks.
-    Use force=True to bypass this check.
-    """
-    session_id = get_current_session_id()
-    if not session_id:
-        return {"error": "No active session"}
-    
-    redis = get_redis_client()
-    
-    # Verify agent exists
-    agent = redis.get_agent(session_id, agent_id)
-    if not agent:
-        return {"error": f"Agent {agent_id} not found"}
-    
-    # Check if agent already has tasks (unless force=True)
-    if not force:
-        if agent.current_task_id:
-            return {
-                "error": f"Agent {agent_id} is already running a task",
-                "current_task_id": agent.current_task_id,
-                "hint": "Use force=True to queue anyway, or wait for the task to complete",
-            }
-        if agent.task_queue_length > 0:
-            return {
-                "error": f"Agent {agent_id} already has {agent.task_queue_length} queued task(s)",
-                "hint": "Use force=True to queue anyway, or wait for tasks to complete",
-            }
-    
-    task = Task(
-        title=task_description[:50],
-        description=task_description,
-        from_agent="mcp_client",
-        files=files,
-    )
-    
-    redis.push_task(session_id, agent_id, task)
-    
-    return {
-        "task_id": task.id,
-        "agent_id": agent_id,
-        "title": task.title,
-        "status": "queued",
-    }
-
-
-@mcp.tool()
 def get_status() -> dict[str, Any]:
     """
     Get the current status of all agents and tasks.
@@ -862,9 +803,10 @@ def get_status() -> dict[str, Any]:
     agent_status = []
     for agent in agents:
         heartbeat_age = int(current_time - agent.last_heartbeat)
+        role_short = agent.role[:60] + "..." if len(agent.role) > 60 else agent.role
         agent_status.append({
             "id": agent.id,
-            "role": agent.role,
+            "role": role_short,
             "status": agent.status.value,
             "current_task": agent.current_task_id,
             "queue_length": agent.task_queue_length,
@@ -973,14 +915,14 @@ def send_message(
     from_agent: str = Field(default="orchestrator", description="Sender ID (defaults to 'orchestrator')"),
 ) -> dict[str, Any]:
     """
-    Send a message to an agent's message queue.
+    Send a follow-up message to an agent's message queue.
+    
+    NOTE: Agents already start with their initial task from spawn_agent.
+    Use this only for follow-up instructions AFTER the agent has completed
+    its initial task and is polling for messages.
     
     The message is queued and the agent will receive it when they call
-    receive_message(). This is the primary way for the orchestrator to
-    communicate with agents.
-    
-    Since Copilot CLI doesn't accept tmux send-keys, this uses the same
-    message queue that agents poll via MCP tools.
+    receive_message().
     """
     session_id = get_current_session_id()
     if not session_id:
@@ -1016,7 +958,8 @@ def receive_message_from_agents(
     Receive a message sent to the orchestrator from any agent.
     
     Agents can send messages to 'orchestrator' using send_to_agent.
-    Use this to receive those messages and monitor game progress.
+    Use this to receive those messages. Call this in a loop to collect
+    results from all workers.
     
     Returns the first message in the queue, or indicates no message after timeout.
     """
@@ -1080,10 +1023,13 @@ def read_pane_output(
     lines: int = Field(default=50, description="Number of lines to capture"),
 ) -> dict[str, Any]:
     """
-    Read recent output from an agent's tmux pane.
+    Read recent output from an agent's tmux pane (DEBUGGING ONLY).
     
-    Use this to see what an agent has outputted, including responses
-    to messages you've sent.
+    WARNING: Do NOT use this for regular workflow. Agents send results via
+    send_to_agent("orchestrator", ...). Use receive_message_from_agents() instead.
+    
+    This tool is for debugging only - to inspect what an agent is doing when
+    message-based communication isn't working.
     """
     session_id = get_current_session_id()
     if not session_id:
@@ -1107,64 +1053,6 @@ def read_pane_output(
         "agent_id": agent_id,
         "output": output,
         "lines_captured": len(output.split('\n')),
-    }
-
-
-@mcp.tool()
-def wait_for_output(
-    agent_id: str = Field(description="ID of the agent to wait for"),
-    timeout: int = Field(default=30, description="Maximum seconds to wait"),
-    poll_interval: float = Field(default=2.0, description="Seconds between checks"),
-) -> dict[str, Any]:
-    """
-    Wait for an agent to produce new output.
-    
-    Polls the agent's pane output until it changes or timeout is reached.
-    Use after sending a message to wait for the agent's response.
-    """
-    import hashlib
-    
-    session_id = get_current_session_id()
-    if not session_id:
-        return {"error": "No active session"}
-    
-    redis = get_redis_client()
-    agent = redis.get_agent(session_id, agent_id)
-    if not agent:
-        return {"error": f"Agent {agent_id} not found"}
-    
-    if not agent.pane_id:
-        return {"error": f"Agent {agent_id} has no pane"}
-    
-    session = redis.get_session(session_id)
-    tmux_session = session.config.get("tmux_session", "agentic") if session else "agentic"
-    tmux = TmuxManager(session_name=tmux_session, use_current_session=False)
-    
-    # Get initial output hash
-    initial_output = tmux.capture_pane_output(agent.pane_id, lines=100)
-    initial_hash = hashlib.md5(initial_output.encode()).hexdigest()
-    
-    elapsed = 0.0
-    while elapsed < timeout:
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-        
-        current_output = tmux.capture_pane_output(agent.pane_id, lines=100)
-        current_hash = hashlib.md5(current_output.encode()).hexdigest()
-        
-        if current_hash != initial_hash:
-            return {
-                "agent_id": agent_id,
-                "status": "output_changed",
-                "elapsed_seconds": elapsed,
-                "output": current_output,
-            }
-    
-    return {
-        "agent_id": agent_id,
-        "status": "timeout",
-        "elapsed_seconds": elapsed,
-        "output": tmux.capture_pane_output(agent.pane_id, lines=100),
     }
 
 
@@ -1250,39 +1138,6 @@ def wait_for_agent_ready(
         "elapsed_seconds": round(elapsed, 1),
         "output": tmux.capture_pane_output(agent.pane_id, lines=100),
     }
-
-
-@mcp.tool()
-def init_hooks(
-    repo_path: str = Field(
-        default=".",
-        description="Path to the repository to initialize hooks in",
-    ),
-) -> dict[str, Any]:
-    """
-    Initialize agentic hooks in a repository.
-    
-    Creates .github/hooks/ with session lifecycle hooks that enable
-    agent registration, file scope validation, and action logging.
-    """
-    from agentic.hooks.install import install_hooks
-    
-    try:
-        path = Path(repo_path).resolve()
-        install_hooks(path)
-        hooks_dir = path / ".github" / "hooks"
-        return {
-            "status": "installed",
-            "hooks_directory": str(hooks_dir),
-            "hooks": [
-                "sessionStart.json - Agent registration",
-                "preToolUse.json - File scope validation",
-                "postToolUse.json - Action logging",
-                "sessionEnd.json - Cleanup",
-            ],
-        }
-    except Exception as e:
-        return {"error": str(e)}
 
 
 # =============================================================================
@@ -1417,6 +1272,34 @@ def review_agent_work(
 
 # =============================================================================
 # Entry Point
+@mcp.prompt()
+def simple_multi_agent(
+    task: str = Field(description="The multi-agent task to perform"),
+) -> str:
+    """
+    Generate a prompt for simple multi-agent workflows using tmux-agents.
+    """
+    return f"""Run this multi-agent task: {task}
+
+**WORKFLOW**:
+
+1. `start_session()` - Create tmux session
+
+2. `spawn_agent(role="<full task description>")` for each worker
+   - Include COMPLETE task in role (not just a title)
+   - Tell agent to send results via `send_to_agent("orchestrator", "<results>")`
+
+3. `receive_message_from_agents()` - CRITICAL: Wait for worker results
+   - Keep calling this until all workers report back
+   - DO NOT skip this step!
+
+4. `stop_session()` - End session when done
+
+**IMPORTANT**: After spawning agents, you MUST call `receive_message_from_agents()` 
+to collect their results. Workers send results via message queue, not pane output.
+"""
+
+
 # =============================================================================
 
 
