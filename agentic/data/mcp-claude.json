@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "agentic": {
+      "command": "agentic-mcp",
+      "args": []
+    }
+  }
+}

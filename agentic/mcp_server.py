@@ -14,66 +14,82 @@ Usage:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
-import subprocess
 import time
-from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from agentic.dag import create_task_flow_diagram, validate_dag
+from agentic.config import (
+    get_config_dir,
+    get_pid_file,
+    get_session_file,
+    ensure_config_dir,
+    cleanup_session_data,
+    WORKING_DIR_ENV_VAR,
+)
 from agentic.models import (
     Agent,
     AgenticSession,
-    ExecutionPlan,
     FileScope,
     SessionStatus,
-    Task,
-    TaskDAG,
-    TaskStatus,
 )
+from agentic.monitor import log_activity
 from agentic.orchestrator import start_orchestrator_background, stop_orchestrator
-from agentic.redis_client import get_client
+from agentic.redis_client import get_client, reset_sqlite_client
 from agentic.tmux_manager import TmuxManager, check_tmux_available
 
 
-# Configuration
-CONFIG_DIR = Path.home() / ".config" / "agentic"
-PID_FILE = CONFIG_DIR / "orchestrator.pid"
-SESSION_FILE = CONFIG_DIR / "current_session"
-
-
-def get_redis_client():
-    """Get storage client (Redis preferred, in-memory fallback)."""
+def get_redis_client(working_dir: str | None = None):
+    """Get storage client (Redis preferred, SQLite fallback).
+    
+    Args:
+        working_dir: Working directory for per-repo storage. If None, uses CWD.
+    """
     return get_client(
         host=os.environ.get("AGENTIC_REDIS_HOST", "localhost"),
         port=int(os.environ.get("AGENTIC_REDIS_PORT", "6379")),
         db=int(os.environ.get("AGENTIC_REDIS_DB", "0")),
+        working_dir=working_dir,
     )
 
 
-def get_current_session_id() -> str | None:
-    """Get the current session ID if one exists."""
-    if SESSION_FILE.exists():
-        return SESSION_FILE.read_text().strip()
+def get_current_session_id(working_dir: str | None = None) -> str | None:
+    """Get the current session ID if one exists.
+    
+    Args:
+        working_dir: Working directory to check. If None, uses CWD.
+    """
+    session_file = get_session_file(working_dir)
+    if session_file.exists():
+        return session_file.read_text().strip()
     return os.environ.get("AGENTIC_SESSION_ID")
 
 
-def save_current_session_id(session_id: str) -> None:
-    """Save the current session ID."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    SESSION_FILE.write_text(session_id)
+def save_current_session_id(session_id: str, working_dir: str | None = None) -> None:
+    """Save the current session ID.
+    
+    Args:
+        session_id: The session ID to save.
+        working_dir: Working directory for per-repo storage. If None, uses CWD.
+    """
+    ensure_config_dir(working_dir)
+    session_file = get_session_file(working_dir)
+    session_file.write_text(session_id)
 
 
-def clear_current_session() -> None:
-    """Clear the current session ID."""
-    if SESSION_FILE.exists():
-        SESSION_FILE.unlink()
+def clear_current_session(working_dir: str | None = None) -> None:
+    """Clear the current session ID.
+    
+    Args:
+        working_dir: Working directory for per-repo storage. If None, uses CWD.
+    """
+    session_file = get_session_file(working_dir)
+    if session_file.exists():
+        session_file.unlink()
 
 
 # Create the MCP server
@@ -95,10 +111,13 @@ def _start_session_internal(
     if not check_tmux_available():
         return {"error": "tmux is not installed or not in PATH"}
     
-    storage = get_redis_client()
+    # Normalize working_dir early
+    working_dir = os.path.abspath(working_dir)
+    
+    storage = get_redis_client(working_dir)
     
     # Check for existing session
-    existing_id = get_current_session_id()
+    existing_id = get_current_session_id(working_dir)
     if existing_id:
         session = storage.get_session(existing_id)
         if session and session.status not in (SessionStatus.COMPLETED, SessionStatus.FAILED):
@@ -108,6 +127,12 @@ def _start_session_internal(
                 "status": "existing",
                 "working_directory": session.working_directory,
             }
+    
+    # Clean up old session data (logs, database) for a fresh start
+    cleanup_result = cleanup_session_data(working_dir)
+    
+    # Reset the SQLite singleton to ensure fresh connection after cleanup
+    reset_sqlite_client(working_dir)
     
     # Detect current tmux session if not provided
     if not tmux_session:
@@ -141,14 +166,16 @@ def _start_session_internal(
         if not tmux_session:
             tmux_session = "agentic"  # fallback
     
+    # Re-get storage after cleanup (singleton was cleared)
+    storage = get_redis_client(working_dir)
+    
     # Create new session
-    working_dir = os.path.abspath(working_dir)
     session = AgenticSession(working_directory=working_dir)
     session.config["cli_command"] = cli_command
     session.config["tmux_session"] = tmux_session
     
     storage.create_session(session)
-    save_current_session_id(session.id)
+    save_current_session_id(session.id, working_dir)
 
     # Create tmux session with admin pane (use configured session name)
     tmux = TmuxManager(session_name=tmux_session, use_current_session=False)
@@ -157,15 +184,25 @@ def _start_session_internal(
     storage.update_session_status(session.id, SessionStatus.RUNNING)
     
     # Start orchestrator daemon
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = CONFIG_DIR / f"orchestrator_{session.id}.log"
+    config_dir = ensure_config_dir(working_dir)
+    log_file = config_dir / f"orchestrator_{session.id}.log"
     pid = start_orchestrator_background(
         session_id=session.id,
         log_file=str(log_file),
+        working_dir=working_dir,
     )
     
+    pid_file = get_pid_file(working_dir)
     if pid:
-        PID_FILE.write_text(str(pid))
+        pid_file.write_text(str(pid))
+    
+    # Log session start
+    log_activity("session_start", {
+        "working_dir": working_dir,
+        "cli_command": cli_command,
+        "orchestrator_pid": pid,
+        "cleanup": cleanup_result,
+    }, session_id=session.id, working_dir=working_dir)
     
     return {
         "session_id": session.id,
@@ -173,6 +210,7 @@ def _start_session_internal(
         "working_directory": working_dir,
         "cli_command": cli_command,
         "orchestrator_pid": pid,
+        "cleanup": cleanup_result,
     }
 
 
@@ -212,12 +250,19 @@ def stop_session(
     By default, keeps worker panes alive so you can review the conversations.
     Set kill_panes=True to clean them up.
     """
-    session_id = get_current_session_id()
+    # Try to find the session from CWD first
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         return {"status": "no_session", "message": "No active session"}
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
     session = redis.get_session(session_id)
+    
+    # Get actual working dir from session if available
+    if session:
+        working_dir = session.working_directory
+    
     killed_panes = []
     
     if session and kill_panes:
@@ -238,8 +283,9 @@ def stop_session(
     redis.push_done_to_all(session_id)
     
     # Stop orchestrator
-    if PID_FILE.exists():
-        stop_orchestrator(str(PID_FILE))
+    pid_file = get_pid_file(working_dir)
+    if pid_file.exists():
+        stop_orchestrator(str(pid_file))
     
     if clear_data:
         # Delete all agents and session data
@@ -250,7 +296,13 @@ def stop_session(
     else:
         redis.update_session_status(session_id, SessionStatus.COMPLETED)
     
-    clear_current_session()
+    clear_current_session(working_dir)
+    
+    # Log session stop
+    log_activity("session_stop", {
+        "killed_panes": killed_panes,
+        "data_cleared": clear_data,
+    }, session_id=session_id, working_dir=working_dir)
     
     return {
         "session_id": session_id,
@@ -260,338 +312,95 @@ def stop_session(
     }
 
 
-@mcp.tool()
-def resume_session() -> dict[str, Any]:
-    """
-    Resume an existing session and get its current state.
-    
-    Returns session info and list of active agents.
-    """
-    session_id = get_current_session_id()
-    if not session_id:
-        return {"status": "no_session", "message": "No session to resume. Call plan_tasks to start."}
-    
-    redis = get_redis_client()
-    session = redis.get_session(session_id)
-    if not session:
-        clear_current_session()
-        return {"status": "not_found", "message": "Session not found. Call plan_tasks to start."}
-    
-    agents = redis.get_all_agents(session_id)
-    
-    return {
-        "session_id": session_id,
-        "status": session.status.value,
-        "working_directory": session.working_directory,
-        "agents": [
-            {"id": a.id, "role": a.role, "status": a.status.value}
-            for a in agents
-        ],
-        "hint": "Call plan_tasks to create a new plan or get_status for details",
-    }
-
-
-@mcp.tool()
-def plan_tasks(
-    prompt: str = Field(description="Natural language description of the task to plan"),
-    working_dir: str = Field(
-        default=".",
-        description="Working directory for the agents (starts session if needed)",
-    ),
-    suggested_agents: int = Field(
-        default=3,
-        description="Suggested number of agents to use",
-    ),
-) -> dict[str, Any]:
-    """
-    Get context and template for planning a multi-agent task.
-    
-    Automatically starts a session if one doesn't exist.
-    Returns project file context and a template structure. You (the host model)
-    should then call `create_plan` with your plan.
-    """
-    # Auto-start session if needed
-    session_id = get_current_session_id()
-    redis = get_redis_client()
-    
-    if not session_id:
-        # Start a new session automatically
-        start_result = _start_session_internal(working_dir)
-        if "error" in start_result:
-            return start_result
-        session_id = start_result["session_id"]
-    
-    session = redis.get_session(session_id)
-    if not session:
-        return {"error": "Session not found"}
-    
-    # Get file context
-    wd = session.working_directory
-    try:
-        result = subprocess.run(
-            ["find", ".", "-type", "f", "-name", "*.py", "-o", "-name", "*.ts", "-o", "-name", "*.js"],
-            capture_output=True,
-            text=True,
-            cwd=wd,
-            timeout=5,
-        )
-        files = [f.strip() for f in result.stdout.strip().split("\n") if f.strip()][:100]
-    except Exception:
-        files = []
-    
-    files_summary = ", ".join(files[:20]) if files else "No files found"
-    if len(files) > 20:
-        files_summary += f" (+{len(files) - 20} more)"
-    
-    return {
-        "session_id": session_id,
-        "instructions": """
-Create an execution plan by calling `create_plan` with agents and tasks.
-
-Guidelines:
-1. Identify natural boundaries in the work (by module, by concern, by file type)
-2. Maximize parallelism where tasks are independent
-3. Create explicit dependencies where order matters
-4. Assign clear file scopes to prevent conflicts
-5. Include review/validation tasks when appropriate
-""",
-        "prompt": prompt,
-        "working_directory": wd,
-        "files_in_scope": files_summary,
-        "suggested_agents": suggested_agents,
-        "next_step": "Call create_plan with your plan structure",
-        "example": {
-            "agents": [
-                {"id": "W1", "role": "Main Developer", "scope_patterns": ["src/**"], "read_only": False},
-                {"id": "W2", "role": "Test Writer", "scope_patterns": ["tests/**"], "read_only": False},
-            ],
-            "tasks": [
-                {"id": "t1", "title": "Implement feature", "description": "...", "agent_id": "W1", "dependencies": [], "files": []},
-                {"id": "t2", "title": "Write tests", "description": "...", "agent_id": "W2", "dependencies": ["t1"], "files": []},
-            ],
-        },
-    }
-
-
-@mcp.tool()
-def create_plan(
-    prompt: str = Field(description="Original task description"),
-    agents: list[dict] = Field(
-        description="List of agents with id, role, scope_patterns, and read_only"
-    ),
-    tasks: list[dict] = Field(
-        description="List of tasks with id, title, description, agent_id, dependencies, and files"
-    ),
-) -> dict[str, Any]:
-    """
-    Create an execution plan from structured input.
-    
-    Use this after plan_tasks returns a planning template. The host model
-    should fill out the plan structure and call this to create the plan.
-    
-    Example:
-        create_plan(
-            prompt="Add authentication",
-            agents=[
-                {"id": "W1", "role": "Auth Developer", "scope_patterns": ["src/auth/**"], "read_only": False}
-            ],
-            tasks=[
-                {"id": "t1", "title": "Implement JWT", "description": "Add JWT auth", "agent_id": "W1", "dependencies": [], "files": ["src/auth/jwt.py"]}
-            ]
-        )
-    """
-    session_id = get_current_session_id()
-    if not session_id:
-        return {"error": "No active session. Run start_session first."}
-    
-    redis = get_redis_client()
-    
-    # Build the execution plan
-    plan_agents = []
-    for a in agents:
-        plan_agents.append(Agent(
-            id=a.get("id", f"W{len(plan_agents)+1}"),
-            role=a.get("role", "Worker"),
-            scope=FileScope(
-                patterns=a.get("scope_patterns", ["**/*"]),
-                read_only=a.get("read_only", False),
-            ),
-        ))
-    
-    dag = TaskDAG()
-    for t in tasks:
-        task = Task(
-            id=t.get("id", f"t{len(dag.tasks)+1}"),
-            title=t.get("title", ""),
-            description=t.get("description", ""),
-            agent_id=t.get("agent_id"),
-            dependencies=t.get("dependencies", []),
-            files=t.get("files", []),
-        )
-        dag.add_task(task)
-    
-    execution_plan = ExecutionPlan(
-        prompt=prompt,
-        agents=plan_agents,
-        dag=dag,
-        estimated_communications=[],
-    )
-    
-    # Validate DAG
-    valid, errors = validate_dag(execution_plan.dag)
-    if not valid:
-        return {
-            "error": "Plan validation failed",
-            "validation_errors": errors,
-            "hint": "Fix the issues and call create_plan again",
-        }
-    
-    # Store plan for execution
-    plan_id = f"plan_{session_id}_{int(time.time())}"
-    redis.store_pending_plan(plan_id, execution_plan)
-    
-    return {
-        "plan_id": plan_id,
-        "prompt": prompt,
-        "agents": [
-            {
-                "id": a.id,
-                "role": a.role,
-                "scope": {
-                    "patterns": a.scope.patterns,
-                    "read_only": a.scope.read_only,
-                },
-            }
-            for a in plan_agents
-        ],
-        "tasks": [
-            {
-                "id": t.id,
-                "title": t.title,
-                "description": t.description,
-                "agent_id": t.agent_id,
-                "dependencies": t.dependencies,
-            }
-            for t in dag.tasks.values()
-        ],
-        "task_flow": create_task_flow_diagram(dag),
-        "validation": {"is_valid": True, "errors": []},
-        "hint": f"Call execute_plan with plan_id='{plan_id}' to execute this plan",
-    }
-
-
-@mcp.tool()
-def execute_plan(
-    plan_id: str = Field(description="Plan ID from plan_tasks output"),
-) -> dict[str, Any]:
-    """
-    Execute an approved execution plan.
-    
-    Spawns agents in tmux panes and dispatches initial tasks.
-    """
-    session_id = get_current_session_id()
-    if not session_id:
-        return {"error": "No active session"}
-    
-    redis = get_redis_client()
-    session = redis.get_session(session_id)
-    if not session:
-        return {"error": "Session not found"}
-    
-    # Retrieve the plan
-    execution_plan = redis.get_pending_plan(plan_id)
-    if not execution_plan:
-        return {"error": f"Plan {plan_id} not found. Create a new plan with plan_tasks."}
-    
-    # Validate DAG before execution
-    valid, errors = validate_dag(execution_plan.dag)
-    if not valid:
-        return {
-            "error": "Plan validation failed",
-            "validation_errors": errors,
-        }
-    
-    # Use the stored tmux session
-    tmux_session = session.config.get("tmux_session", "agentic")
-    tmux = TmuxManager(session_name=tmux_session, use_current_session=False)
-    cli_command = session.config.get("cli_command", "copilot -i")
-    
-    # Spawn worker panes
-    pane_mapping = tmux.spawn_multiple_workers(
-        agents=execution_plan.agents,
-        working_dir=session.working_directory,
-        cli_command=cli_command,
-        session_id=session_id,
-    )
-    
-    # Register agents in Redis
-    spawned_agents = []
-    for agent in execution_plan.agents:
-        agent.pane_id = pane_mapping.get(agent.id)
-        redis.register_agent(session_id, agent)
-        spawned_agents.append({
-            "id": agent.id,
-            "role": agent.role,
-            "pane_id": agent.pane_id,
-        })
-    
-    # Save DAG
-    redis.save_dag(session_id, execution_plan.dag)
-    
-    # Dispatch initial tasks
-    ready_tasks = execution_plan.dag.get_ready_tasks()
-    dispatched_tasks = []
-    for task in ready_tasks:
-        if task.agent_id:
-            redis.push_task(session_id, task.agent_id, task)
-            redis.update_task_status(session_id, task.id, TaskStatus.PENDING)
-            dispatched_tasks.append({
-                "task_id": task.id,
-                "agent_id": task.agent_id,
-                "title": task.title,
-            })
-    
-    # Clear the pending plan
-    redis.delete_pending_plan(plan_id)
-    
-    return {
-        "status": "executing",
-        "spawned_agents": spawned_agents,
-        "dispatched_tasks": dispatched_tasks,
-        "total_tasks": len(execution_plan.dag.tasks),
-        "monitor_hint": "Use get_status to monitor progress",
-    }
-
-
 def _build_communication_instructions(agent_id: str, other_agents: list[str]) -> str:
-    """Build inter-agent communication instructions to include in agent prompts."""
-    agents_list = ", ".join(other_agents) if other_agents else "none yet (use list_agents to discover)"
+    """Build inter-agent communication instructions to include in agent prompts.
+    
+    Uses imperative language and consequence framing based on research showing
+    this improves LLM tool-calling reliability.
+    """
+    agents_list = ", ".join(other_agents) if other_agents else "unknown (call list_agents() to discover)"
     return f"""
+## ⚠️ CRITICAL: Communication Protocol (READ FIRST)
 
-## Inter-Agent Communication
+You are agent **{agent_id}**. Known agents: {agents_list}
 
-You are agent **{agent_id}**. Other agents in this session: {agents_list}
+**Your text responses are NOT delivered to other agents or the orchestrator.**
+You MUST use MCP tools for ALL communication. If you don't call the tools below,
+your work will be LOST and the task will FAIL.
 
-You have MCP tools for inter-agent communication:
+---
 
-- **list_agents()** - List all agents in this session (call this first!)
-- **send_to_agent(agent_id, message)** - Send a message to another agent (or "orchestrator")
-- **receive_message(timeout=300)** - Wait for and receive the next message
-- **check_messages()** - Check if there are pending messages (non-blocking)
-- **broadcast_message(message)** - Send to all agents
+## REQUIRED MCP Tools (from "agentic-worker" server)
 
-**WORKFLOW:**
-1. Call `list_agents()` to discover available agents
-2. Execute your initial task
-3. Send final results to orchestrator via `send_to_agent(agent_id="orchestrator", message="...")`
-4. Enter polling loop: keep calling `receive_message(timeout=300)` for follow-up instructions
+### 1. list_agents() - CALL THIS FIRST
+Discovers all agents in this multi-agent session. Returns agent IDs and roles.
+You MUST call this before doing any work so you know who to coordinate with.
+Without this call, you cannot properly address messages to other agents.
 
-**POLLING LOOP - DO NOT EXIT:**
-- If `status` is "received": process message, respond, then poll again
-- If `status` is "no_message": poll again immediately - DO NOT EXIT
-- If `status` is "session_terminated": exit gracefully
-- If message contains "TERMINATE": exit gracefully
-- NEVER end your turn without an explicit termination signal
+### 2. send_to_agent(agent_id, message) - REQUIRED FOR RESULTS
+Sends a message to another agent or the orchestrator. This is your ONLY method
+to communicate. 
+- To reply to another agent → use their agent_id (e.g., "W1", "W2")
+- To report final results → use agent_id="orchestrator"
+⚠️ If you don't call this, your output goes NOWHERE. Text responses are not delivered.
+
+### 3. receive_message(timeout=300) - REQUIRED FOR COORDINATION  
+Waits for incoming messages. Returns status: "received", "no_message", or
+"session_terminated". You MUST call this in a loop after reporting results.
+Exit ONLY when status is "session_terminated" or message contains "TERMINATE".
+
+### 4. check_messages() - Optional
+Non-blocking check for pending messages. Use before blocking operations.
+
+### 5. broadcast_message(message) - Optional
+Sends to all agents at once. Use for session-wide announcements.
+
+---
+
+## MANDATORY 4-Phase Workflow
+
+### Phase 1: DISCOVERY (DO THIS IMMEDIATELY)
+```
+FIRST ACTION: Call list_agents() now.
+```
+Do NOT proceed to your task until you have discovered other agents.
+
+### Phase 2: EXECUTE YOUR TASK
+Complete your assigned work. Stay focused on your specific task.
+
+### Phase 3: REPORT RESULTS (CRITICAL - NEVER SKIP)
+When communicating with other agents, reply to them directly:
+```
+send_to_agent(agent_id="W1", message="<your reply>")  # reply to W1
+```
+When your task is FULLY complete, report to orchestrator:
+```
+send_to_agent(agent_id="orchestrator", message="{{status: 'complete', agent_id: '{agent_id}', result: <summary>}}")
+```
+⚠️ Skipping send_to_agent = your output is LOST. Text responses go nowhere.
+
+### Phase 4: POLLING LOOP (DO NOT EXIT EARLY)
+```
+ENTER THIS LOOP and stay in it:
+while True:
+    msg = receive_message(timeout=300)
+    if msg.status == "session_terminated": break
+    if msg.status == "received" and "TERMINATE" in msg.message: break
+    if msg.status == "received": process and respond
+    # "no_message" status = keep polling, DO NOT EXIT
+```
+⚠️ Exiting without TERMINATE signal will cause session failure.
+
+---
+
+## Pre-Completion Checklist
+Before ending your turn, verify you have:
+✓ Called list_agents() 
+✓ Completed your task
+✓ Called send_to_agent("orchestrator", ...) with results
+✓ Entered polling loop OR received TERMINATE
+
+Missing any step = STOP and complete it NOW.
 """
 
 
@@ -635,20 +444,23 @@ def spawn_agent(
     Example role: "Analyze all Python files in src/ for security vulnerabilities,
     then send a JSON report to the orchestrator via send_to_agent."
     """
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     
     # Auto-start session if none exists
     if not session_id:
-        working_dir = os.getcwd()
         start_result = _start_session_internal(working_dir, "copilot -i")
         if "error" in start_result:
             return {"error": f"Failed to auto-start session: {start_result['error']}"}
         session_id = start_result["session_id"]
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
     session = redis.get_session(session_id)
     if not session:
         return {"error": "Session not found"}
+    
+    # Use session's working directory
+    working_dir = session.working_directory
     
     # Get existing agents to determine next ID
     existing_agents = redis.get_all_agents(session_id)
@@ -684,6 +496,13 @@ def spawn_agent(
     agent.pane_id = pane_id
     redis.register_agent(session_id, agent)
     
+    # Log agent spawn
+    log_activity("agent_spawn", {
+        "agent_id": agent.id,
+        "role": role[:50],
+        "pane_id": pane_id,
+    }, session_id=session_id, working_dir=working_dir)
+    
     result = {
         "agent_id": agent.id,
         "role": role[:100] + "..." if len(role) > 100 else role,  # Truncate for readability
@@ -692,7 +511,7 @@ def spawn_agent(
             "patterns": agent.scope.patterns,
             "read_only": agent.scope.read_only,
         },
-        "next_step": "Agent is starting. Call receive_message_from_agents() to wait for results.",
+        "next_step": "Call receive_message_from_agents() to collect results, then terminate_all_agents() when done.",
     }
     
     # Wait for agent to be ready if requested
@@ -788,11 +607,12 @@ def get_status() -> dict[str, Any]:
     """
     Get the current status of all agents and tasks.
     """
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         return {"error": "No active session"}
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
     session = redis.get_session(session_id)
     if not session:
         return {"error": "Session not found"}
@@ -814,92 +634,11 @@ def get_status() -> dict[str, Any]:
             "healthy": heartbeat_age < 120,
         })
     
-    # Get DAG progress
-    dag = redis.get_dag(session_id)
-    if dag:
-        completed, total = dag.get_completion_progress()
-        progress = {
-            "completed_tasks": completed,
-            "total_tasks": total,
-            "percentage": round(completed / total * 100, 1) if total > 0 else 0,
-        }
-    else:
-        progress = {"completed_tasks": 0, "total_tasks": 0, "percentage": 0}
-    
     return {
         "session_id": session_id,
         "session_status": session.status.value,
         "working_directory": session.working_directory,
         "agents": agent_status,
-        "progress": progress,
-    }
-
-
-@mcp.tool()
-def get_agent_logs(
-    agent_id: str = Field(description="ID of the agent"),
-    count: int = Field(default=50, description="Number of log entries to retrieve"),
-) -> dict[str, Any]:
-    """
-    Get recent logs for a specific agent.
-    """
-    session_id = get_current_session_id()
-    if not session_id:
-        return {"error": "No active session"}
-    
-    redis = get_redis_client()
-    logs = redis.get_agent_logs(session_id, agent_id, count=count)
-    
-    return {
-        "agent_id": agent_id,
-        "logs": [
-            {
-                "timestamp": time.strftime("%H:%M:%S", time.localtime(log.timestamp)),
-                "action": log.action,
-                "file": log.file,
-                "tool": log.tool,
-            }
-            for log in logs
-        ],
-    }
-
-
-@mcp.tool()
-def clear_agents() -> dict[str, Any]:
-    """
-    Clear all worker agents but keep the session.
-    
-    Useful for starting fresh with a new plan.
-    """
-    session_id = get_current_session_id()
-    if not session_id:
-        return {"error": "No active session"}
-    
-    redis = get_redis_client()
-    session = redis.get_session(session_id)
-    
-    # Use stored tmux session
-    tmux_session = session.config.get("tmux_session", "agentic") if session else "agentic"
-    tmux = TmuxManager(session_name=tmux_session, use_current_session=False)
-    
-    # Send done signal
-    redis.push_done_to_all(session_id)
-    
-    # Kill worker panes
-    killed = tmux.kill_all_workers()
-    
-    # Clear agents from Redis
-    agents = redis.get_all_agents(session_id)
-    for agent in agents:
-        redis.delete_agent(session_id, agent.id)
-    
-    # Clear DAG
-    redis.save_dag(session_id, TaskDAG())
-    
-    return {
-        "killed_panes": killed,
-        "cleared_agents": len(agents),
-        "status": "cleared",
     }
 
 
@@ -924,11 +663,16 @@ def send_message(
     The message is queued and the agent will receive it when they call
     receive_message().
     """
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         return {"error": "No active session"}
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
+    session = redis.get_session(session_id)
+    if not session:
+        return {"error": "Session not found"}
+    
     agent = redis.get_agent(session_id, agent_id)
     if not agent:
         return {"error": f"Agent {agent_id} not found"}
@@ -940,6 +684,13 @@ def send_message(
         to_agent=agent_id,
         message=message,
     )
+    
+    # Log message sent
+    log_activity("message_sent", {
+        "from": from_agent,
+        "to": agent_id,
+        "message_preview": message[:500],
+    }, session_id=session_id, working_dir=session.working_directory)
     
     return {
         "status": "queued",
@@ -961,13 +712,18 @@ def receive_message_from_agents(
     Use this to receive those messages. Call this in a loop to collect
     results from all workers.
     
+    IMPORTANT: After collecting all results, call `terminate_all_agents()` to
+    signal workers to exit their polling loops. Otherwise they will hang forever.
+    
     Returns the first message in the queue, or indicates no message after timeout.
     """
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         return {"error": "No active session"}
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
+    session = redis.get_session(session_id)
     
     # Receive message addressed to 'orchestrator'
     msg = redis.receive_agent_message(session_id, "orchestrator", timeout=timeout)
@@ -976,7 +732,15 @@ def receive_message_from_agents(
         return {
             "status": "no_message",
             "waited_seconds": timeout,
+            "hint": "If all expected agents reported, call terminate_all_agents() to end session cleanly.",
         }
+    
+    # Log message received
+    log_activity("message_received", {
+        "agent_id": "orchestrator",
+        "from": msg.get("from"),
+        "message_preview": msg.get("message", "")[:50],
+    }, session_id=session_id, working_dir=session.working_directory if session else working_dir)
     
     return {
         "status": "received",
@@ -984,6 +748,7 @@ def receive_message_from_agents(
         "from": msg.get("from"),
         "message": msg.get("message"),
         "timestamp": msg.get("timestamp"),
+        "next_step": "Collect more results or call terminate_all_agents() when done.",
     }
 
 
@@ -994,11 +759,12 @@ def check_orchestrator_messages() -> dict[str, Any]:
     
     Use this to see if any agents have sent messages without blocking.
     """
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         return {"error": "No active session"}
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
     count = redis.get_message_count(session_id, "orchestrator")
     
     # Also peek at the messages
@@ -1018,6 +784,90 @@ def check_orchestrator_messages() -> dict[str, Any]:
 
 
 @mcp.tool()
+def terminate_agent(
+    agent_id: str = Field(description="ID of the agent to terminate (e.g., 'W1', 'W2')"),
+) -> dict[str, Any]:
+    """
+    Send a TERMINATE message to a specific agent, signaling it to exit its polling loop.
+    
+    IMPORTANT: Workers wait in a polling loop after completing their task. You MUST
+    call this (or terminate_all_agents) after collecting results, otherwise workers
+    will hang indefinitely waiting for more instructions.
+    
+    The agent will receive a message containing "TERMINATE" and should exit gracefully.
+    """
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
+    if not session_id:
+        return {"error": "No active session"}
+    
+    redis = get_redis_client(working_dir)
+    session = redis.get_session(session_id)
+    agent = redis.get_agent(session_id, agent_id)
+    if not agent:
+        return {"error": f"Agent {agent_id} not found"}
+    
+    # Send TERMINATE message
+    msg_id = redis.send_agent_message(
+        session_id=session_id,
+        from_agent="orchestrator",
+        to_agent=agent_id,
+        message="TERMINATE",
+    )
+    
+    # Log agent terminate
+    log_activity("agent_terminate", {
+        "agent_id": agent_id,
+    }, session_id=session_id, working_dir=session.working_directory if session else working_dir)
+    
+    return {
+        "status": "terminate_sent",
+        "agent_id": agent_id,
+        "message_id": msg_id,
+    }
+
+
+@mcp.tool()
+def terminate_all_agents() -> dict[str, Any]:
+    """
+    Send TERMINATE to all agents and mark the session as done.
+    
+    IMPORTANT: Call this after you have collected all results from workers.
+    This ensures all agents exit their polling loops gracefully. Workers that
+    are still in their polling loop will receive the termination signal.
+    
+    This is the recommended way to end a multi-agent session cleanly.
+    """
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
+    if not session_id:
+        return {"error": "No active session"}
+    
+    redis = get_redis_client(working_dir)
+    agents = redis.get_all_agents(session_id)
+    
+    terminated = []
+    for agent in agents:
+        redis.send_agent_message(
+            session_id=session_id,
+            from_agent="orchestrator",
+            to_agent=agent.id,
+            message="TERMINATE",
+        )
+        terminated.append(agent.id)
+    
+    # Also mark session as done (backup termination via is_session_done check)
+    redis.push_done_to_all(session_id)
+    
+    return {
+        "status": "all_terminated",
+        "agents_notified": terminated,
+        "count": len(terminated),
+        "session_marked_done": True,
+    }
+
+
+@mcp.tool()
 def read_pane_output(
     agent_id: str = Field(description="ID of the agent to read output from"),
     lines: int = Field(default=50, description="Number of lines to capture"),
@@ -1031,11 +881,12 @@ def read_pane_output(
     This tool is for debugging only - to inspect what an agent is doing when
     message-based communication isn't working.
     """
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         return {"error": "No active session"}
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
     agent = redis.get_agent(session_id, agent_id)
     if not agent:
         return {"error": f"Agent {agent_id} not found"}
@@ -1056,90 +907,6 @@ def read_pane_output(
     }
 
 
-@mcp.tool()
-def wait_for_agent_ready(
-    agent_id: str = Field(description="ID of the agent to wait for"),
-    timeout: int = Field(default=120, description="Maximum seconds to wait"),
-    completion_phrases: list[str] = Field(
-        default=[],
-        description="Phrases to look for indicating the agent has finished responding (e.g., 'higher', 'lower', 'correct')",
-    ),
-) -> dict[str, Any]:
-    """
-    Wait for an agent to finish its current task/response.
-    
-    Use this after the agent has received a prompt to wait until it has finished
-    generating a response. Looks for output stabilization or specific completion phrases.
-    
-    For the guess-the-number game, use completion_phrases=['higher', 'lower', 'correct']
-    to detect when the Chooser has responded.
-    """
-    import hashlib
-    
-    session_id = get_current_session_id()
-    if not session_id:
-        return {"error": "No active session"}
-    
-    redis = get_redis_client()
-    agent = redis.get_agent(session_id, agent_id)
-    if not agent:
-        return {"error": f"Agent {agent_id} not found"}
-    
-    if not agent.pane_id:
-        return {"error": f"Agent {agent_id} has no pane"}
-    
-    session = redis.get_session(session_id)
-    tmux_session = session.config.get("tmux_session", "agentic") if session else "agentic"
-    tmux = TmuxManager(session_name=tmux_session, use_current_session=False)
-    
-    start_time = time.time()
-    poll_interval = 2.0
-    stable_count = 0
-    last_hash = ""
-    
-    while (time.time() - start_time) < timeout:
-        current_output = tmux.capture_pane_output(agent.pane_id, lines=100)
-        current_hash = hashlib.md5(current_output.encode()).hexdigest()
-        
-        # Check for completion phrases in output
-        output_lower = current_output.lower()
-        for phrase in completion_phrases:
-            if phrase.lower() in output_lower:
-                elapsed = time.time() - start_time
-                return {
-                    "agent_id": agent_id,
-                    "status": "completion_phrase_found",
-                    "phrase": phrase,
-                    "elapsed_seconds": round(elapsed, 1),
-                    "output": current_output,
-                }
-        
-        # Check for output stabilization (same hash for 3 consecutive polls)
-        if current_hash == last_hash:
-            stable_count += 1
-            if stable_count >= 3:
-                elapsed = time.time() - start_time
-                return {
-                    "agent_id": agent_id,
-                    "status": "output_stabilized",
-                    "elapsed_seconds": round(elapsed, 1),
-                    "output": current_output,
-                }
-        else:
-            stable_count = 0
-        
-        last_hash = current_hash
-        time.sleep(poll_interval)
-    
-    elapsed = time.time() - start_time
-    return {
-        "agent_id": agent_id,
-        "status": "timeout",
-        "elapsed_seconds": round(elapsed, 1),
-        "output": tmux.capture_pane_output(agent.pane_id, lines=100),
-    }
-
-
 # =============================================================================
 # MCP Resources
 # =============================================================================
@@ -1148,11 +915,12 @@ def wait_for_agent_ready(
 @mcp.resource("session://status")
 def get_session_status_resource() -> str:
     """Current session status as JSON."""
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         return json.dumps({"error": "No active session"})
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
     session = redis.get_session(session_id)
     if not session:
         return json.dumps({"error": "Session not found"})
@@ -1165,29 +933,15 @@ def get_session_status_resource() -> str:
     }, indent=2)
 
 
-@mcp.resource("dag://current")
-def get_dag_resource() -> str:
-    """Current task DAG visualization."""
-    session_id = get_current_session_id()
-    if not session_id:
-        return "No active session"
-    
-    redis = get_redis_client()
-    dag = redis.get_dag(session_id)
-    if not dag:
-        return "No DAG defined"
-    
-    return create_task_flow_diagram(dag)
-
-
 @mcp.resource("agents://list")
 def get_agents_resource() -> str:
     """List of all agents in the current session."""
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         return json.dumps({"error": "No active session"})
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
     agents = redis.get_all_agents(session_id)
     
     return json.dumps([
@@ -1207,67 +961,6 @@ def get_agents_resource() -> str:
 # =============================================================================
 # MCP Prompts
 # =============================================================================
-
-
-@mcp.prompt()
-def orchestrate_task(
-    task: str = Field(description="The task to orchestrate"),
-    working_dir: str = Field(default=".", description="Working directory"),
-) -> str:
-    """
-    Generate a prompt for orchestrating a multi-agent task.
-    """
-    return f"""Orchestrate this task using multiple AI coding agents:
-
-Task: {task}
-Working Directory: {working_dir}
-
-Steps:
-
-1. **Plan** - Call `plan_tasks(prompt="{task}", working_dir="{working_dir}")`
-   This auto-starts a session and returns project context.
-
-2. **Create Plan** - Call `create_plan` with:
-   - agents: List with id, role, scope_patterns (and optionally read_only)
-   - tasks: List with id, title, description, agent_id, dependencies
-
-3. **Execute** - Call `execute_plan(plan_id="...")`
-
-4. **Monitor** - Call `get_status()` to track progress
-
-5. **Complete** - Call `stop_session()` when done
-
-Tips:
-- Maximize parallelism - independent tasks can run concurrently
-- Use clear file scopes to prevent conflicts between agents
-- Include a reviewer agent for validation tasks
-"""
-
-
-@mcp.prompt()
-def review_agent_work(
-    agent_id: str = Field(description="The agent ID to review"),
-) -> str:
-    """
-    Generate a prompt for reviewing an agent's work.
-    """
-    return f"""Review the work done by agent {agent_id}.
-
-1. First, get the agent's logs:
-   Call `get_agent_logs` with agent_id="{agent_id}"
-
-2. Check the current status:
-   Call `get_status` to see if the agent has pending tasks
-
-3. Based on the logs, evaluate:
-   - What tasks did the agent complete?
-   - Were there any errors or issues?
-   - Did the agent stay within its file scope?
-   - Should any work be redone or extended?
-
-4. If needed, send follow-up tasks:
-   Use `send_task` to assign corrections or additional work
-"""
 
 
 # =============================================================================
@@ -1293,10 +986,14 @@ def simple_multi_agent(
    - Keep calling this until all workers report back
    - DO NOT skip this step!
 
-4. `stop_session()` - End session when done
+4. `terminate_all_agents()` - CRITICAL: Signal workers to exit
+   - Workers are waiting in a polling loop for more instructions
+   - If you don't call this, they will hang indefinitely!
 
-**IMPORTANT**: After spawning agents, you MUST call `receive_message_from_agents()` 
-to collect their results. Workers send results via message queue, not pane output.
+5. `stop_session()` - End session when done
+
+**IMPORTANT**: After collecting all results, you MUST call `terminate_all_agents()` 
+to signal workers to exit. Skipping this leaves workers stuck in their polling loop.
 """
 
 

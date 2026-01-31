@@ -47,6 +47,7 @@ dev = [
 agentic = "agentic.cli:main"
 agentic-mcp = "agentic.mcp_server:main"
 agentic-worker-mcp = "agentic.worker_mcp:main"
+agentic-monitor = "agentic.monitor:main"
 
 [project.urls]
 Homepage = "https://github.com/agentic-cli/agentic-tmux"

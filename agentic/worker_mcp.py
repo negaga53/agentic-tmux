@@ -24,25 +24,37 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
+from agentic.config import (
+    get_debug_log,
+    ensure_config_dir,
+    WORKING_DIR_ENV_VAR,
+)
 from agentic.redis_client import get_client
+from agentic.monitor import log_activity
 
 
-# Debug logging
-DEBUG_LOG = Path.home() / ".config" / "agentic" / "worker_mcp_debug.log"
-DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+def _get_working_dir() -> str:
+    """Get working directory from environment or CWD."""
+    return os.environ.get(WORKING_DIR_ENV_VAR) or os.getcwd()
+
 
 def _log_debug(msg: str) -> None:
     """Write debug message to log file."""
-    with open(DEBUG_LOG, "a") as f:
+    working_dir = _get_working_dir()
+    debug_log = get_debug_log(working_dir, "worker_mcp_debug")
+    ensure_config_dir(working_dir)
+    with open(debug_log, "a") as f:
         f.write(f"{time.time()}: {msg}\n")
 
 
 def get_storage():
     """Get storage client."""
+    working_dir = _get_working_dir()
     return get_client(
         host=os.environ.get("AGENTIC_REDIS_HOST", "localhost"),
         port=int(os.environ.get("AGENTIC_REDIS_PORT", "6379")),
         db=int(os.environ.get("AGENTIC_REDIS_DB", "0")),
+        working_dir=working_dir,
     )
 
 
@@ -61,17 +73,30 @@ _log_debug("Worker MCP server created")
 
 @worker_mcp.tool()
 def send_to_agent(
-    agent_id: str = Field(description="ID of the agent to send message to (e.g., 'W1', 'W2')"),
-    message: str = Field(description="The message content to send"),
+    agent_id: str = Field(
+        description="Target agent ID (e.g., 'W1', 'W2', 'orchestrator'). Use 'orchestrator' to report results to the coordinator."
+    ),
+    message: str = Field(
+        description="Complete message content. Include all relevant data - results, status, errors. This is the ONLY way to deliver information."
+    ),
 ) -> dict[str, Any]:
     """
-    Send a message to another agent in the session.
+    Send a message to another agent or the orchestrator. This is your ONLY method
+    to deliver results - text output in your response is NOT seen by other agents.
     
-    Messages are queued and the target agent will receive them when they
-    call receive_message. Use this for inter-agent communication.
+    CRITICAL: You MUST call this with agent_id="orchestrator" to report your final
+    results. If you don't call this, the orchestrator will never receive your work
+    and the session will hang or fail. Always include complete results in the message.
     
-    Example:
-        send_to_agent(agent_id="W1", message="My guess is 50")
+    Use this after completing your task to report results, or to coordinate with
+    other workers during execution. Messages are queued and delivered when the
+    recipient calls receive_message().
+    
+    Example - reporting results:
+        send_to_agent(agent_id="orchestrator", message='{"status": "complete", "result": "analysis done"}')
+    
+    Example - coordinating with another worker:
+        send_to_agent(agent_id="W2", message="Ready for you to start tests")
     """
     session_id, my_agent_id = get_session_info()
     
@@ -96,6 +121,13 @@ def send_to_agent(
         message=message,
     )
     
+    # Log message sent
+    log_activity("message_sent", {
+        "from": my_agent_id,
+        "to": agent_id,
+        "message_preview": message[:500],
+    }, session_id=session_id, working_dir=_get_working_dir())
+    
     return {
         "status": "sent",
         "message_id": msg_id,
@@ -108,22 +140,31 @@ def send_to_agent(
 @worker_mcp.tool()
 def receive_message(
     timeout: int = Field(
-        default=60,
-        description="Seconds to wait for a message (0 for non-blocking)",
+        default=300,
+        description="Seconds to wait for a message. Use 300 (5 min) for normal polling, 0 for non-blocking check.",
     ),
 ) -> dict[str, Any]:
     """
-    Receive the next message from the queue.
+    Wait for and receive the next incoming message. You MUST call this in a loop
+    after reporting your results to stay available for follow-up instructions.
     
-    Messages are received in order (FIFO). If no message is available,
-    waits up to `timeout` seconds. Use timeout=0 for non-blocking check.
+    Returns one of three statuses:
+    - "received": A message arrived. Process it and respond if needed.
+    - "no_message": No message within timeout. DO NOT EXIT - call again to keep polling.
+    - "session_terminated": Session is ending. Exit gracefully.
     
-    Also checks if the session has been terminated via push_done_to_all.
-    If session is done, returns a termination signal.
+    CRITICAL: If status is "no_message", you MUST call receive_message again.
+    Do NOT exit or end your turn. The orchestrator may send follow-up work at any time.
+    Only exit when status is "session_terminated" or message contains "TERMINATE".
     
-    Example:
-        receive_message(timeout=60)  # Wait up to 60 seconds
-        receive_message(timeout=0)   # Check and return immediately
+    Example polling loop:
+        while True:
+            msg = receive_message(timeout=300)
+            if msg["status"] == "session_terminated": break
+            if msg["status"] == "received":
+                if "TERMINATE" in msg["message"]: break
+                # process message and respond
+            # "no_message" -> continue loop, do NOT exit
     """
     session_id, agent_id = get_session_info()
     
@@ -161,6 +202,13 @@ def receive_message(
             "waited_seconds": timeout,
         }
     
+    # Log message received
+    log_activity("message_received", {
+        "agent_id": agent_id,
+        "from": msg.get("from"),
+        "message_preview": msg.get("message", "")[:50],
+    }, session_id=session_id, working_dir=_get_working_dir())
+    
     return {
         "status": "received",
         "message_id": msg.get("id"),
@@ -173,9 +221,14 @@ def receive_message(
 @worker_mcp.tool()
 def check_messages() -> dict[str, Any]:
     """
-    Check how many messages are waiting without receiving them.
+    Check how many messages are waiting without blocking or removing them.
     
-    Use this to see if there are pending messages before blocking on receive.
+    Use this for a quick, non-blocking check before starting a long operation.
+    Returns the count of pending messages. This does NOT remove messages from
+    the queue - use receive_message() to actually get and process them.
+    
+    This is optional - you can also just call receive_message(timeout=0) for
+    a similar non-blocking check that also retrieves the first message.
     """
     session_id, agent_id = get_session_info()
     
@@ -230,9 +283,17 @@ def peek_messages(
 @worker_mcp.tool()
 def list_agents() -> dict[str, Any]:
     """
-    List all agents in the current session.
+    Discover all agents in this multi-agent session. CALL THIS FIRST before
+    doing any other work. Returns the IDs and roles of all workers.
     
-    Use this to discover which agents are available to communicate with.
+    This tells you who else is working in the session, so you can coordinate.
+    Without calling this, you won't know which agent IDs are valid for
+    send_to_agent(). The orchestrator also needs you to call this to confirm
+    you've properly initialized.
+    
+    Returns your own agent ID in 'my_agent_id' and a list of all agents
+    including yourself. Use this to understand the team structure before
+    starting your task.
     """
     _log_debug("list_agents: START")
     session_id, agent_id = get_session_info()
@@ -296,14 +357,19 @@ def get_my_info() -> dict[str, Any]:
 
 @worker_mcp.tool()
 def broadcast_message(
-    message: str = Field(description="Message to send to all agents"),
-    exclude_self: bool = Field(default=True, description="Exclude self from broadcast"),
+    message: str = Field(description="Message to send to all agents. Include complete information as this goes to everyone."),
+    exclude_self: bool = Field(default=True, description="Whether to exclude yourself from the broadcast (default: True)"),
 ) -> dict[str, Any]:
     """
-    Send a message to all agents in the session.
+    Send a message to ALL agents in the session at once. Use this for
+    session-wide announcements that everyone needs to know about.
     
-    Broadcasts the message to every agent. Useful for announcements
-    or when you need to reach all agents at once.
+    This is a convenience method that calls send_to_agent() for each agent.
+    For targeted communication to specific agents, use send_to_agent() directly.
+    By default, you won't receive your own broadcast (exclude_self=True).
+    
+    Example: Announcing completion of a shared dependency:
+        broadcast_message(message="Shared library update complete, you can proceed")
     """
     session_id, agent_id = get_session_info()
     

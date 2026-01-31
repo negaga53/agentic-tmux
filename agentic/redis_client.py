@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -11,13 +12,21 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Generator
 
-# Set up debug logging for inter-agent communication
-DEBUG_LOG = Path.home() / ".config" / "agentic" / "sqlite_debug.log"
-DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+from agentic.config import get_db_path, get_debug_log, ensure_config_dir, WORKING_DIR_ENV_VAR
 
-def _log_debug(msg: str) -> None:
+
+def _get_debug_log_path(working_dir: str | None = None) -> Path:
+    """Get the debug log path for the given working directory."""
+    if working_dir is None:
+        working_dir = os.environ.get(WORKING_DIR_ENV_VAR) or os.getcwd()
+    return get_debug_log(working_dir, "sqlite_debug")
+
+
+def _log_debug(msg: str, working_dir: str | None = None) -> None:
     """Write debug message to log file."""
-    with open(DEBUG_LOG, "a") as f:
+    debug_log = _get_debug_log_path(working_dir)
+    ensure_config_dir(working_dir)
+    with open(debug_log, "a") as f:
         f.write(f"{time.time()}: {msg}\n")
 
 import redis
@@ -102,10 +111,6 @@ class RedisKeys:
         return f"plan:pending:{plan_id}"
 
 
-# Default SQLite database path
-DEFAULT_DB_PATH = Path.home() / ".config" / "agentic" / "agentic.db"
-
-
 class SQLiteAgenticClient:
     """SQLite client for agentic-tmux when Redis is not available.
     
@@ -113,8 +118,17 @@ class SQLiteAgenticClient:
     All tmux panes can share state via the database file.
     """
 
-    def __init__(self, db_path: Path | str | None = None):
-        self._db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
+    def __init__(self, db_path: Path | str | None = None, working_dir: str | None = None):
+        """Initialize SQLite client.
+        
+        Args:
+            db_path: Explicit database path (overrides working_dir)
+            working_dir: Working directory for per-repo storage
+        """
+        if db_path:
+            self._db_path = Path(db_path)
+        else:
+            self._db_path = get_db_path(working_dir)
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._init_db()
@@ -877,18 +891,54 @@ class SQLiteAgenticClient:
         return result
 
 
-# Singleton for SQLite storage (shared across all usages)
-_sqlite_client: SQLiteAgenticClient | None = None
+# Singleton for SQLite storage (keyed by working_dir)
+# Using a dict to allow per-repo singletons
+_sqlite_clients: dict[str, SQLiteAgenticClient] = {}
 _sqlite_lock = threading.Lock()
 
 
-def get_sqlite_client(db_path: Path | str | None = None) -> SQLiteAgenticClient:
-    """Get the singleton SQLite client instance."""
-    global _sqlite_client
+def get_sqlite_client(
+    db_path: Path | str | None = None,
+    working_dir: str | None = None,
+) -> SQLiteAgenticClient:
+    """Get the singleton SQLite client instance for the given working directory.
+    
+    Args:
+        db_path: Explicit database path (overrides working_dir-based path)
+        working_dir: Working directory for per-repo storage. If None, uses CWD or env var.
+    """
+    global _sqlite_clients
+    
+    if working_dir is None:
+        working_dir = os.environ.get(WORKING_DIR_ENV_VAR) or os.getcwd()
+    
+    # Normalize the working_dir path for consistency
+    working_dir = os.path.abspath(working_dir)
+    
     with _sqlite_lock:
-        if _sqlite_client is None:
-            _sqlite_client = SQLiteAgenticClient(db_path)
-        return _sqlite_client
+        if working_dir not in _sqlite_clients:
+            _sqlite_clients[working_dir] = SQLiteAgenticClient(db_path, working_dir)
+        return _sqlite_clients[working_dir]
+
+
+def reset_sqlite_client(working_dir: str | None = None) -> None:
+    """Reset the SQLite client singleton for the given working directory.
+    
+    Call this after cleanup to ensure fresh connections to new database.
+    
+    Args:
+        working_dir: Working directory. If None, uses CWD or env var.
+    """
+    global _sqlite_clients
+    
+    if working_dir is None:
+        working_dir = os.environ.get(WORKING_DIR_ENV_VAR) or os.getcwd()
+    
+    working_dir = os.path.abspath(working_dir)
+    
+    with _sqlite_lock:
+        if working_dir in _sqlite_clients:
+            del _sqlite_clients[working_dir]
 
 
 def get_client(
@@ -896,11 +946,19 @@ def get_client(
     port: int = 6379,
     db: int = 0,
     prefer_redis: bool = True,
+    working_dir: str | None = None,
 ) -> "AgenticRedisClient | SQLiteAgenticClient":
     """Get the appropriate storage client.
     
     If prefer_redis is True and Redis is available, returns a Redis client.
     Otherwise returns the SQLite client for persistent cross-process storage.
+    
+    Args:
+        host: Redis host
+        port: Redis port
+        db: Redis database number
+        prefer_redis: Whether to prefer Redis over SQLite
+        working_dir: Working directory for per-repo SQLite storage
     """
     if prefer_redis:
         try:
@@ -910,7 +968,7 @@ def get_client(
         except Exception:
             pass
     
-    return get_sqlite_client()
+    return get_sqlite_client(working_dir=working_dir)
 
 
 class AgenticRedisClient:

@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "agentic": {
+      "command": "agentic-mcp",
+      "args": []
+    }
+  }
+}

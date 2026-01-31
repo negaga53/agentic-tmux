@@ -1,40 +1,30 @@
 # Agentic TMUX
 
-Multi-agent orchestration for CLI coding assistants via tmux panes.
+> Multi-agent orchestration for GitHub Copilot CLI and Claude Code via tmux panes.
 
-## Overview
+Spawn multiple AI coding agents that work in parallel, communicate with each other, and report back to you—all running in separate tmux panes you can watch in real-time.
 
-Agentic TMUX allows you to spawn multiple AI coding agents (GitHub Copilot CLI, Claude, etc.) in separate tmux panes that can:
+## Quick Start (2 minutes)
 
-- Execute tasks in parallel
-- Communicate with each other via message queues
-- Stay within defined file scopes
-- Report progress to a central admin pane
+### Prerequisites
 
-**No external dependencies required** - runs with SQLite storage by default (for cross-process communication), or use Redis for additional features.
+| Requirement | How to Install |
+|-------------|---------------|
+| **tmux** | `brew install tmux` or `apt install tmux` |
+| **Python 3.11+** | [python.org](https://python.org) or your package manager |
+| **GitHub Copilot CLI** | `npm install -g @githubnext/github-copilot-cli` |
+| *or* **Claude Code** | `npm install -g @anthropic-ai/claude-code` |
 
-## Features
-
-- **Multi-agent orchestration** - Spawn and coordinate multiple AI agents
-- **Interactive planning** - LLM generates task DAG, you approve/modify
-- **Real-time communication** - Message queues for agent-to-agent messaging
-- **Deadlock prevention** - Orchestrator daemon monitors for circular waits
-- **Session resume** - Reuse existing agents for new prompts
-- **Failure recovery** - Automatic retry with exponential backoff
-- **MCP Server interface** - Integrate with VS Code, Claude Desktop, or any MCP client
-- **Optional Redis** - Works with in-memory storage or Redis for persistence
-
-## Prerequisites
-
-- Python 3.11+
-- tmux
-- GitHub Copilot CLI (`copilot`) or Claude CLI
-- Redis server (optional, for persistence)
-
-## Installation
+### Install
 
 ```bash
 pip install agentic-tmux
+```
+
+Or run the setup script (checks prerequisites + configures everything):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/agentic-cli/agentic-tmux/main/setup.sh | bash
 ```
 
 Or from source:
@@ -43,290 +33,247 @@ Or from source:
 git clone https://github.com/agentic-cli/agentic-tmux
 cd agentic-tmux
 pip install -e .
+agentic setup  # Interactive configuration wizard
 ```
 
-## Quick Start
+### Configure Your Editor
 
-### Using MCP (Recommended)
-
-The MCP server is the primary interface. Configure it in your MCP client:
-
-1. **Add to VS Code** (`.vscode/mcp.json`):
-   ```json
-   {
-     "servers": {
-       "agentic": {
-         "command": "agentic-mcp"
-       }
-     }
-   }
-   ```
-
-2. **Use MCP tools from your AI assistant**:
-   - `plan_tasks("Refactor auth module")` - Auto-starts session
-   - `create_plan(...)` - Create plan from your analysis
-   - `execute_plan(plan_id)` - Spawn agents and dispatch tasks
-   - `get_status()` - Monitor progress
-   - `stop_session()` - Clean up when done
-
-### Manual CLI
-
-For debugging or manual control:
-
-1. **Start Redis** (optional):
-   ```bash
-   redis-server
-   ```
-   *Without Redis, data is stored in SQLite (`~/.config/agentic/agentic.db`) which persists across restarts.*
-
-2. **Monitor with CLI** (after MCP creates session):
-   ```bash
-   agentic status --watch
-   ```
-
-3. **View agent logs**:
-   ```bash
-   agentic logs W1 -f
-   ```
-
-## CLI Commands
-
-The CLI is primarily for debugging and monitoring. Use MCP for orchestration.
-
-| Command | Description |
-|---------|-------------|
-| `agentic mcp` | **Start MCP server** (primary interface) |
-| `agentic status` | Show status of all agents |
-| `agentic logs <agent_id>` | View logs for an agent |
-| `agentic send <agent_id> "task"` | Send a task to an agent |
-| `agentic stop` | Stop the current session |
-| `agentic clear` | Clear all workers |
-| `agentic export` | Export session transcript |
-
-## MCP Server
-
-Agentic TMUX can be used as a Model Context Protocol (MCP) server, allowing integration with VS Code, Claude Desktop, and other MCP-compatible clients.
-
-### VS Code Integration
-
-Add to your VS Code settings (`.vscode/mcp.json`):
+**For VS Code** (GitHub Copilot CLI), add to `.vscode/mcp.json`:
 
 ```json
 {
   "servers": {
     "agentic": {
-      "command": "agentic-mcp",
-      "env": {
-        "AGENTIC_REDIS_HOST": "localhost"
-      }
+      "command": "agentic-mcp"
     }
   }
 }
 ```
 
-Or start manually:
-
-```bash
-agentic mcp
-```
-
-### Claude Desktop Integration
-
-Add to your Claude Desktop config (`~/.config/claude/claude_desktop_config.json`):
+**For Claude Desktop**, add to `~/.config/claude/claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "agentic": {
-      "command": "agentic-mcp",
-      "env": {
-        "AGENTIC_REDIS_HOST": "localhost"
-      }
+      "command": "agentic-mcp"
     }
   }
 }
 ```
 
-### MCP Tools
+Or run `agentic setup` to configure automatically.
 
-| Tool | Description |
-|------|-------------|
-| `plan_tasks` | Get context and template for planning (auto-starts session) |
-| `create_plan` | Create execution plan from structured input |
-| `execute_plan` | Execute an approved plan |
-| `resume_session` | Resume an existing session |
-| `stop_session` | Stop the current session |
-| `spawn_agent` | Spawn a single new agent |
-| `send_task` | Send a task to a specific agent |
-| `get_status` | Get status of all agents and tasks |
-| `get_agent_logs` | Get logs for a specific agent |
-| `clear_agents` | Clear all workers, keep session |
+### Use It
 
-### MCP Resources
+1. **Start tmux** (agents run in tmux panes):
+   ```bash
+   tmux new -s work
+   ```
 
-| Resource | Description |
-|----------|-------------|
-| `session://status` | Current session state (JSON) |
-| `dag://current` | Task DAG visualization |
-| `agents://list` | List of all agents |
+2. **Open your project in VS Code or Claude Desktop**
 
-### MCP Prompts
+3. **Ask your AI assistant to use the agentic tools**:
+   ```
+   "Use agentic to spawn 2 agents: one to refactor the auth module, 
+    another to write tests. Have them report back when done."
+   ```
 
-| Prompt | Description |
-|--------|-------------|
-| `orchestrate_task` | Guide for orchestrating a multi-agent task |
-| `review_agent_work` | Guide for reviewing an agent's work |
+4. **Watch agents work** in tmux panes, or use the monitor:
+   ```bash
+   agentic status --watch
+   ```
 
-### Example MCP Workflow
+---
 
-From within an MCP client (like VS Code Copilot or Claude Desktop):
+## How It Works
 
 ```
-1. plan_tasks(prompt="Add authentication", working_dir="/path/to/project")
-   → Auto-starts session, returns project context
-
-2. create_plan(
-     prompt="Add authentication",
-     agents=[{id: "W1", role: "Developer", scope_patterns: ["src/**"]}],
-     tasks=[{id: "t1", title: "Implement auth", agent_id: "W1", dependencies: []}]
-   )
-   → Returns plan_id
-
-3. execute_plan(plan_id="...")
-   → Spawns agents in tmux, dispatches tasks
-
-4. get_status()
-   → Monitor progress
-
-5. stop_session()
-   → Clean up when done
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    Your Editor (VS Code / Claude Desktop)                 │
+│           "Spawn 3 agents to refactor, test, and review..."              │
+└───────────────────────────────────┬──────────────────────────────────────┘
+                                    │ MCP Protocol
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         Agentic MCP Server                                │
+│                 Coordinates agents, manages message queues               │
+└───────────────────────────────────┬──────────────────────────────────────┘
+                                    │
+            ┌───────────────────────┼───────────────────────┐
+            ▼                       ▼                       ▼
+┌───────────────────┐   ┌───────────────────┐   ┌───────────────────┐
+│  TMUX Pane: W1    │   │  TMUX Pane: W2    │   │  TMUX Pane: W3    │
+│                   │   │                   │   │                   │
+│  copilot -i       │   │  copilot -i       │   │  copilot -i       │
+│  "Refactor auth"  │   │  "Write tests"    │   │  "Review code"    │
+└─────────┬─────────┘   └─────────┬─────────┘   └─────────┬─────────┘
+          │                       │                       │
+          └───────────────────────┴───────────────────────┘
+                                  │
+                    Message Queue (SQLite/Redis)
+                    Agents can talk to each other!
 ```
 
-**Resume a session:**
+**Key Features:**
+- ✅ Agents run in visible tmux panes—watch them work in real-time
+- ✅ Agents communicate via message queues (no shared state issues)
+- ✅ Works offline with SQLite (Redis optional for persistence)
+- ✅ Auto-cleanup on new sessions
+- ✅ Compatible with GitHub Copilot CLI and Claude Code
+
+---
+
+## MCP Tools Reference
+
+When you configure MCP, your AI assistant gets these tools:
+
+### Essential Tools (Simple Workflow)
+
+| Tool | What It Does |
+|------|--------------|
+| `start_session()` | Start a new multi-agent session |
+| `spawn_agent(role="...")` | Spawn an agent with a task |
+| `receive_message_from_agents()` | Get results from agents |
+| `terminate_all_agents()` | Clean up when done |
+| `stop_session()` | End the session |
+
+### Example: Simple Two-Agent Task
+
+Tell your AI assistant:
 ```
-resume_session()  → Returns session state and active agents
+Use agentic to:
+1. Start a session
+2. Spawn agent W1 to refactor src/auth.py with better error handling
+3. Spawn agent W2 to write tests for src/auth.py  
+4. Wait for both to finish and report their results
+5. Stop the session
 ```
+
+### Advanced Tools
+
+| Tool | What It Does |
+|------|--------------|
+| `get_status()` | Monitor all agents and tasks |
+| `get_agent_logs(agent_id)` | View detailed logs for an agent |
+
+---
+
+## CLI Commands
+
+The CLI is for monitoring and debugging. Use MCP tools for orchestration.
+
+```bash
+# Run the setup wizard
+agentic setup
+
+# Check system configuration
+agentic doctor
+
+# Start MCP server (usually auto-started by your editor)
+agentic mcp
+
+# Monitor agents in real-time
+agentic status --watch
+
+# View agent logs
+agentic logs W1 -f
+
+# Interactive monitoring dashboard
+agentic monitor
+
+# Stop current session
+agentic stop
+
+# Export session data
+agentic export
+```
+
+---
 
 ## Configuration
 
-### Environment Variables
+### Environment Variables (Optional)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AGENTIC_REDIS_HOST` | localhost | Redis host (if using Redis) |
 | `AGENTIC_REDIS_PORT` | 6379 | Redis port |
-| `AGENTIC_REDIS_DB` | 0 | Redis database |
 
-> **Note:** Redis environment variables are only used if Redis is available. Without Redis, data is stored in-memory.
+Without Redis, data is stored in `.agentic/agentic.db` in your project directory—automatically cleaned up on new sessions.
 
-## Architecture
+### Per-Project Configuration
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         MCP CLIENT (VS Code, Claude Desktop, etc.)       │
-└────────────────────────────────┬────────────────────────────────────────┘
-                                 │ MCP Protocol (stdio)
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         MCP SERVER (agentic-mcp)                         │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Tools: plan_tasks, execute_plan, get_status, send_task, ...            │
-│  Resources: session://status, dag://current, agents://list              │
-│  Prompts: orchestrate_task, review_agent_work                           │
-└────────────────────────────────┬────────────────────────────────────────┘
-                                 │
-            ┌────────────────────┴────────────────────┐
-            ▼                                         ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              TMUX SESSION                                │
-├─────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────────┐   ┌─────────────────┐   ┌─────────────────┐       │
-│  │   ADMIN PANE    │   │  WORKER PANE 1  │   │  WORKER PANE 2  │  ...  │
-│  │                 │   │                 │   │                 │       │
-│  │  copilot        │   │  copilot        │   │  copilot        │       │
-│  └────────┬────────┘   └────────┬────────┘   └────────┬────────┘       │
-│           │                     │                     │                 │
-└───────────┼─────────────────────┼─────────────────────┼─────────────────┘
-            │                     │                     │
-            ▼                     ▼                     ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                              REDIS                                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  session:{id}:config    │  Session state                                │
-│  session:{id}:dag       │  Task dependency graph                        │
-│  agent:{id}:queue       │  Per-agent task queue                         │
-│  agent:{id}:status      │  Agent status                                 │
-│  agent:{id}:log         │  Action stream                                │
-└─────────────────────────────────────────────────────────────────────────┘
-            ▲
-            │
-┌───────────┴───────────┐
-│   ORCHESTRATOR DAEMON  │
-├────────────────────────┤
-│  - Heartbeat monitor   │
-│  - Deadlock detection  │
-│  - Task completion     │
-└────────────────────────┘
+Add `.vscode/mcp.json` to any project for project-specific MCP setup:
+
+```json
+{
+  "servers": {
+    "agentic": {
+      "command": "agentic-mcp"
+    }
+  }
+}
 ```
 
-## Example Plan Output
+---
 
-```
-╭─────────────────────────────────────────────────────────────────────╮
-│                     📋 EXECUTION PLAN                                │
-│                                                                      │
-│  Prompt: "Refactor auth module and add comprehensive tests"          │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                      │
-│  AGENTS TO SPAWN: 3                                                  │
-│                                                                      │
-│  ┌─────┬────────────────────┬─────────────────────────────────────┐ │
-│  │ ID  │ Role               │ File Scope                          │ │
-│  ├─────┼────────────────────┼─────────────────────────────────────┤ │
-│  │ W1  │ Auth Refactorer    │ src/auth/**, src/utils/crypto.ts    │ │
-│  │ W2  │ Test Author        │ tests/auth/**, tests/fixtures/**    │ │
-│  │ W3  │ Code Reviewer      │ READ-ONLY: src/**, tests/**         │ │
-│  └─────┴────────────────────┴─────────────────────────────────────┘ │
-│                                                                      │
-│  TASK FLOW:                                                          │
-│                                                                      │
-│      ┌──────────┐                                                    │
-│      │ W1: Auth │                                                    │
-│      │ Refactor │                                                    │
-│      └────┬─────┘                                                    │
-│           │                                                          │
-│           ▼                                                          │
-│      ┌──────────┐      ┌──────────┐                                 │
-│      │ W2: Test │ ───► │ W3: Rev  │                                 │
-│      └──────────┘      └──────────┘                                 │
-│                                                                      │
-╰─────────────────────────────────────────────────────────────────────╯
+## Troubleshooting
+
+### "agentic: command not found"
+
+Your Python scripts directory isn't in PATH:
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+# Add to ~/.bashrc or ~/.zshrc to make permanent
 ```
 
-## Inter-Agent Communication
+### Agents not spawning
 
-Agents communicate via Redis queues. To send a task to another agent:
+1. Make sure tmux is running: `tmux new -s work`
+2. Check you're inside tmux when running commands
+3. Run `agentic doctor` to diagnose issues
+
+### Agents not communicating
+
+1. Check storage is working: `agentic doctor`
+2. If using Redis, make sure it's running: `redis-server`
+3. Check agent logs: `agentic logs W1`
+
+### MCP tools not appearing
+
+1. Restart your editor after adding MCP configuration
+2. Verify config syntax with `agentic doctor`
+3. Check MCP server starts: `agentic mcp` (should show "Starting MCP server...")
+
+### Debug Hooks (Advanced)
+
+For detailed agent behavior logging with GitHub Copilot CLI:
 
 ```bash
-redis-cli LPUSH agent:$SESSION_ID:W2:queue '{"task":"review changes","from":"W1","files":["src/auth/login.ts"]}'
+# Install hooks
+agentic setup --hooks
+
+# After running agents, analyze logs
+~/.github/hooks/analyze-agent-logs.sh
 ```
 
-Agents poll their queues and process tasks sequentially.
+Logs are written to `.agentic/logs/` in your project directory.
 
-## Deadlock Prevention
+---
 
-The orchestrator daemon runs checks every 30 seconds:
+## How Agents Communicate
 
-1. **Heartbeat monitoring** - Respawns panes that haven't sent a heartbeat in 2 minutes
-2. **Circular wait detection** - Breaks deadlocks by unblocking one agent
-3. **Task stuck detection** - Escalates if an agent is working on one task for too long
+Each spawned agent automatically gets instructions (via `AGENTS.md`) to:
 
-## Error Handling
+1. **Discover** other agents using `list_agents()`
+2. **Execute** their assigned task
+3. **Report** results with `send_to_agent("orchestrator", ...)`
+4. **Poll** for follow-up instructions until terminated
 
-When an agent fails:
-1. Automatic retry with exponential backoff (5s → 15s → 45s)
-2. After 3 failures, escalate to admin
-3. Admin can choose to: retry with different model, skip task, or abort session
+This ensures reliable communication—agents report back via message queues, not just text output.
+
+---
 
 ## Development
 
@@ -337,18 +284,23 @@ pip install -e ".[dev]"
 # Run tests
 pytest
 
+# Type check
+mypy agentic/
+
 # Format code
 black agentic/
 ruff agentic/
-
-# Type check
-mypy agentic/
 ```
+
+---
 
 ## License
 
 MIT
 
-## Credits
+## Links
 
-Inspired by discussions in the AI coding community about multi-agent orchestration patterns.
+- [GitHub Repository](https://github.com/agentic-cli/agentic-tmux)
+- [Issue Tracker](https://github.com/agentic-cli/agentic-tmux/issues)
+- [GitHub Copilot CLI](https://githubnext.com/projects/copilot-cli/)
+- [Claude Code](https://www.anthropic.com/claude-code)

@@ -20,6 +20,11 @@ from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.table import Table
 
+from agentic.config import (
+    get_config_dir,
+    get_pid_file,
+    get_session_file,
+)
 from agentic.models import (
     SessionStatus,
     Task,
@@ -30,32 +35,42 @@ from agentic.tmux_manager import TmuxManager
 
 console = Console()
 
-# Config paths
-CONFIG_DIR = Path.home() / ".config" / "agentic"
-PID_FILE = CONFIG_DIR / "orchestrator.pid"
-SESSION_FILE = CONFIG_DIR / "current_session"
 
-
-def get_redis_client():
-    """Get storage client (Redis preferred, in-memory fallback)."""
+def get_redis_client(working_dir: str | None = None):
+    """Get storage client (Redis preferred, SQLite fallback).
+    
+    Args:
+        working_dir: Working directory for per-repo storage. If None, uses CWD.
+    """
     return get_client(
         host=os.environ.get("AGENTIC_REDIS_HOST", "localhost"),
         port=int(os.environ.get("AGENTIC_REDIS_PORT", "6379")),
         db=int(os.environ.get("AGENTIC_REDIS_DB", "0")),
+        working_dir=working_dir,
     )
 
 
-def get_current_session_id() -> str | None:
-    """Get the current session ID if one exists."""
-    if SESSION_FILE.exists():
-        return SESSION_FILE.read_text().strip()
+def get_current_session_id(working_dir: str | None = None) -> str | None:
+    """Get the current session ID if one exists.
+    
+    Args:
+        working_dir: Working directory to check. If None, uses CWD.
+    """
+    session_file = get_session_file(working_dir)
+    if session_file.exists():
+        return session_file.read_text().strip()
     return os.environ.get("AGENTIC_SESSION_ID")
 
 
-def clear_current_session() -> None:
-    """Clear the current session ID."""
-    if SESSION_FILE.exists():
-        SESSION_FILE.unlink()
+def clear_current_session(working_dir: str | None = None) -> None:
+    """Clear the current session ID.
+    
+    Args:
+        working_dir: Working directory for per-repo storage. If None, uses CWD.
+    """
+    session_file = get_session_file(working_dir)
+    if session_file.exists():
+        session_file.unlink()
 
 
 @click.group()
@@ -87,12 +102,13 @@ def mcp(transport: str):
 @click.option("--watch", "-w", is_flag=True, help="Watch mode (updates every 2s)")
 def status(watch: bool):
     """Show status of all agents and tasks."""
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         console.print("[yellow]No active session[/yellow]")
         return
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
     
     if watch:
         with Live(console=console, refresh_per_second=0.5) as live:
@@ -168,12 +184,13 @@ def render_status(session_id: str, storage: Any) -> Panel:
 @click.option("--lines", "-n", default=50, help="Number of lines to show")
 def logs(agent_id: str, follow: bool, lines: int):
     """View logs for a specific agent."""
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         console.print("[yellow]No active session[/yellow]")
         return
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
     
     # Get initial logs
     log_entries = redis.get_agent_logs(session_id, agent_id, count=lines)
@@ -206,12 +223,13 @@ def logs(agent_id: str, follow: bool, lines: int):
 @click.argument("task_description")
 def send(agent_id: str, task_description: str):
     """Send a task to a specific agent."""
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         console.print("[red]Error:[/red] No active session")
         sys.exit(1)
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
     
     task = Task(
         title=task_description[:50],
@@ -226,19 +244,24 @@ def send(agent_id: str, task_description: str):
 @main.command()
 def stop():
     """Stop the current agentic session."""
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         console.print("[yellow]No active session[/yellow]")
         return
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
+    session = redis.get_session(session_id)
+    if session:
+        working_dir = session.working_directory
     
     # Send done signal to all agents
     redis.push_done_to_all(session_id)
     
     # Stop orchestrator
-    if PID_FILE.exists():
-        stop_orchestrator(str(PID_FILE))
+    pid_file = get_pid_file(working_dir)
+    if pid_file.exists():
+        stop_orchestrator(str(pid_file))
         console.print("[green]✓[/green] Stopped orchestrator")
     
     # Kill tmux session
@@ -250,7 +273,7 @@ def stop():
     
     # Update session status
     redis.update_session_status(session_id, SessionStatus.COMPLETED)
-    clear_current_session()
+    clear_current_session(working_dir)
     
     console.print(f"[green]✓[/green] Session [cyan]{session_id}[/cyan] stopped")
 
@@ -259,7 +282,8 @@ def stop():
 @click.option("--force", "-f", is_flag=True, help="Force clear without confirmation")
 def clear(force: bool):
     """Clear all workers but keep the session."""
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         console.print("[yellow]No active session[/yellow]")
         return
@@ -267,7 +291,7 @@ def clear(force: bool):
     if not force and not Confirm.ask("Kill all worker panes?"):
         return
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
     tmux = TmuxManager()
     
     # Send done signal
@@ -289,14 +313,15 @@ def clear(force: bool):
 @click.option("--output", "-o", default="session_export.json", help="Output file")
 def export(output: str):
     """Export session transcript and state."""
-    session_id = get_current_session_id()
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
     if not session_id:
         console.print("[yellow]No active session[/yellow]")
         return
     
     import json
     
-    redis = get_redis_client()
+    redis = get_redis_client(working_dir)
     session = redis.get_session(session_id)
     
     if not session:
@@ -350,7 +375,9 @@ def msg_send(to_agent: str, message: str):
     Workers can use this to communicate with other agents.
     Requires AGENTIC_SESSION_ID and AGENTIC_AGENT_ID environment variables.
     """
-    session_id = os.environ.get("AGENTIC_SESSION_ID") or get_current_session_id()
+    # For workers, get working_dir from env var
+    working_dir = os.environ.get("AGENTIC_WORKING_DIR") or os.getcwd()
+    session_id = os.environ.get("AGENTIC_SESSION_ID") or get_current_session_id(working_dir)
     agent_id = os.environ.get("AGENTIC_AGENT_ID")
     
     if not session_id:
@@ -360,7 +387,7 @@ def msg_send(to_agent: str, message: str):
         console.print("[red]Error:[/red] Agent ID not set (set AGENTIC_AGENT_ID)")
         sys.exit(1)
     
-    storage = get_redis_client()
+    storage = get_redis_client(working_dir)
     
     # Verify target exists
     target = storage.get_agent(session_id, to_agent)
@@ -384,7 +411,9 @@ def msg_recv(timeout: int, raw: bool):
     """
     import json
     
-    session_id = os.environ.get("AGENTIC_SESSION_ID") or get_current_session_id()
+    # For workers, get working_dir from env var
+    working_dir = os.environ.get("AGENTIC_WORKING_DIR") or os.getcwd()
+    session_id = os.environ.get("AGENTIC_SESSION_ID") or get_current_session_id(working_dir)
     agent_id = os.environ.get("AGENTIC_AGENT_ID")
     
     if not session_id:
@@ -394,7 +423,7 @@ def msg_recv(timeout: int, raw: bool):
         console.print("[red]Error:[/red] Agent ID not set (set AGENTIC_AGENT_ID)")
         sys.exit(1)
     
-    storage = get_redis_client()
+    storage = get_redis_client(working_dir)
     msg = storage.receive_agent_message(session_id, agent_id, timeout=timeout)
     
     if not msg:
@@ -420,14 +449,16 @@ def msg_list(raw: bool):
     """
     import json
     
-    session_id = os.environ.get("AGENTIC_SESSION_ID") or get_current_session_id()
+    # For workers, get working_dir from env var
+    working_dir = os.environ.get("AGENTIC_WORKING_DIR") or os.getcwd()
+    session_id = os.environ.get("AGENTIC_SESSION_ID") or get_current_session_id(working_dir)
     agent_id = os.environ.get("AGENTIC_AGENT_ID")
     
     if not session_id:
         console.print("[red]Error:[/red] No active session")
         sys.exit(1)
     
-    storage = get_redis_client()
+    storage = get_redis_client(working_dir)
     agents = storage.get_all_agents(session_id)
     
     if raw:
@@ -465,6 +496,18 @@ def msg_list(raw: bool):
         console.print(table)
 
 
+@main.command()
+@click.option("--refresh", "-r", default=1.5, help="Refresh rate in seconds")
+def monitor(refresh: float):
+    """Launch the real-time monitoring dashboard.
+    
+    Shows agent status, message activity, heartbeats, and session health.
+    Automatically waits for a session if none is active.
+    """
+    from agentic.monitor import run_monitor
+    run_monitor(refresh_rate=refresh)
+
+
 @main.command(name="worker-mcp")
 @click.option("--transport", "-t", default="stdio", help="Transport type")
 def worker_mcp_cmd(transport: str):
@@ -484,6 +527,296 @@ def worker_mcp_cmd(transport: str):
     
     console.print(f"[cyan]Starting Worker MCP server ({transport})...[/cyan]")
     worker_mcp.run(transport=transport)
+
+
+@main.command()
+@click.option("--cli", "-c", type=click.Choice(["copilot", "claude", "both"]), help="Which CLI to configure")
+@click.option("--hooks", is_flag=True, help="Install debug hooks for Copilot CLI")
+@click.option("--project", "-p", is_flag=True, help="Setup for current project only")
+def setup(cli: str | None, hooks: bool, project: bool):
+    """Interactive setup wizard for agentic-tmux.
+    
+    Configures MCP integration for GitHub Copilot CLI and/or Claude Code.
+    """
+    import json
+    import shutil
+    import subprocess
+    
+    from rich.panel import Panel
+    from rich.prompt import Prompt
+    
+    console.print(Panel.fit(
+        "[bold cyan]Agentic TMUX Setup Wizard[/bold cyan]\n"
+        "Configure multi-agent orchestration for your AI coding tools",
+        border_style="cyan",
+    ))
+    
+    # Check prerequisites
+    console.print("\n[bold]Checking prerequisites...[/bold]\n")
+    
+    prereqs_ok = True
+    
+    # tmux
+    if shutil.which("tmux"):
+        console.print("  [green]✓[/green] tmux")
+    else:
+        console.print("  [red]✗[/red] tmux - install with: brew install tmux / apt install tmux")
+        prereqs_ok = False
+    
+    # AI CLIs
+    has_copilot = bool(shutil.which("copilot"))
+    has_claude = bool(shutil.which("claude"))
+    
+    if has_copilot:
+        console.print("  [green]✓[/green] GitHub Copilot CLI")
+    else:
+        console.print("  [yellow]○[/yellow] GitHub Copilot CLI - npm install -g @githubnext/github-copilot-cli")
+    
+    if has_claude:
+        console.print("  [green]✓[/green] Claude Code")
+    else:
+        console.print("  [yellow]○[/yellow] Claude Code - npm install -g @anthropic-ai/claude-code")
+    
+    if not has_copilot and not has_claude:
+        console.print("\n[yellow]Warning:[/yellow] No AI CLI found. Install at least one to use agents.")
+    
+    if not prereqs_ok:
+        console.print("\n[red]Please install missing prerequisites and run again.[/red]")
+        return
+    
+    # Determine which CLI to configure
+    if not cli:
+        if has_copilot and has_claude:
+            cli = Prompt.ask(
+                "\nWhich CLI would you like to configure?",
+                choices=["copilot", "claude", "both"],
+                default="both",
+            )
+        elif has_copilot:
+            cli = "copilot"
+        elif has_claude:
+            cli = "claude"
+        else:
+            cli = Prompt.ask(
+                "\nWhich CLI will you use?",
+                choices=["copilot", "claude", "both"],
+                default="copilot",
+            )
+    
+    # Setup MCP configuration
+    console.print("\n[bold]Configuring MCP integration...[/bold]\n")
+    
+    if project:
+        # Project-specific setup
+        project_dir = Path.cwd()
+        vscode_dir = project_dir / ".vscode"
+        vscode_dir.mkdir(exist_ok=True)
+        
+        mcp_config = {
+            "servers": {
+                "agentic": {
+                    "command": "agentic-mcp",
+                    "args": [],
+                }
+            }
+        }
+        
+        mcp_file = vscode_dir / "mcp.json"
+        if mcp_file.exists():
+            console.print(f"  [yellow]![/yellow] {mcp_file} already exists, backing up...")
+            shutil.copy(mcp_file, f"{mcp_file}.bak")
+        
+        with open(mcp_file, "w") as f:
+            json.dump(mcp_config, f, indent=2)
+        
+        console.print(f"  [green]✓[/green] Created {mcp_file}")
+        
+    else:
+        # Global setup
+        if cli in ("copilot", "both"):
+            # VS Code global MCP config
+            vscode_mcp_dir = Path.home() / ".vscode" / "mcp"
+            vscode_mcp_dir.mkdir(parents=True, exist_ok=True)
+            
+            mcp_file = vscode_mcp_dir / "servers.json"
+            
+            mcp_config = {"servers": {}}
+            if mcp_file.exists():
+                try:
+                    with open(mcp_file) as f:
+                        mcp_config = json.load(f)
+                except json.JSONDecodeError:
+                    pass
+            
+            mcp_config.setdefault("servers", {})["agentic"] = {
+                "command": "agentic-mcp",
+                "args": [],
+            }
+            
+            with open(mcp_file, "w") as f:
+                json.dump(mcp_config, f, indent=2)
+            
+            console.print(f"  [green]✓[/green] VS Code MCP: {mcp_file}")
+        
+        if cli in ("claude", "both"):
+            # Claude Desktop config
+            claude_config_dir = Path.home() / ".config" / "claude"
+            claude_config_dir.mkdir(parents=True, exist_ok=True)
+            
+            claude_file = claude_config_dir / "claude_desktop_config.json"
+            
+            claude_config = {"mcpServers": {}}
+            if claude_file.exists():
+                try:
+                    with open(claude_file) as f:
+                        claude_config = json.load(f)
+                except json.JSONDecodeError:
+                    pass
+            
+            claude_config.setdefault("mcpServers", {})["agentic"] = {
+                "command": "agentic-mcp",
+                "args": [],
+            }
+            
+            with open(claude_file, "w") as f:
+                json.dump(claude_config, f, indent=2)
+            
+            console.print(f"  [green]✓[/green] Claude Desktop: {claude_file}")
+    
+    # Install debug hooks
+    if hooks or (not hooks and Confirm.ask("\nInstall debug hooks for Copilot CLI?", default=False)):
+        hooks_src = Path(__file__).parent.parent / ".github" / "hooks"
+        hooks_dst = Path.home() / ".github" / "hooks"
+        
+        if hooks_src.exists():
+            hooks_dst.mkdir(parents=True, exist_ok=True)
+            for hook_file in hooks_src.glob("*"):
+                shutil.copy(hook_file, hooks_dst)
+                if hook_file.suffix == ".sh":
+                    (hooks_dst / hook_file.name).chmod(0o755)
+            console.print(f"  [green]✓[/green] Debug hooks installed: {hooks_dst}")
+        else:
+            console.print("  [yellow]![/yellow] Debug hooks not found in package")
+    
+    # Print success message
+    console.print(Panel.fit(
+        "[bold green]Setup Complete![/bold green]\n\n"
+        "[cyan]Quick Start:[/cyan]\n"
+        "1. Start tmux: [yellow]tmux new -s work[/yellow]\n"
+        "2. Open VS Code/Claude in your project\n"
+        "3. Use MCP tool: [yellow]plan_tasks(\"your task here\")[/yellow]\n\n"
+        "Or monitor from CLI: [yellow]agentic status --watch[/yellow]",
+        border_style="green",
+    ))
+
+
+@main.command()
+def doctor():
+    """Check system configuration and diagnose issues.
+    
+    Verifies prerequisites, configuration, and connection to services.
+    """
+    import shutil
+    
+    console.print("[bold]Agentic TMUX Health Check[/bold]\n")
+    
+    all_ok = True
+    
+    # Check tmux
+    console.print("[cyan]System Requirements:[/cyan]")
+    if shutil.which("tmux"):
+        result = os.popen("tmux -V").read().strip()
+        console.print(f"  [green]✓[/green] tmux: {result}")
+    else:
+        console.print("  [red]✗[/red] tmux not found")
+        all_ok = False
+    
+    # Check Python
+    import sys
+    py_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    if sys.version_info >= (3, 11):
+        console.print(f"  [green]✓[/green] Python {py_version}")
+    else:
+        console.print(f"  [red]✗[/red] Python {py_version} (need 3.11+)")
+        all_ok = False
+    
+    # Check AI CLIs
+    console.print("\n[cyan]AI CLI Tools:[/cyan]")
+    has_cli = False
+    if shutil.which("copilot"):
+        console.print("  [green]✓[/green] GitHub Copilot CLI")
+        has_cli = True
+    else:
+        console.print("  [dim]○[/dim] GitHub Copilot CLI not installed")
+    
+    if shutil.which("claude"):
+        console.print("  [green]✓[/green] Claude Code")
+        has_cli = True
+    else:
+        console.print("  [dim]○[/dim] Claude Code not installed")
+    
+    if not has_cli:
+        console.print("  [yellow]![/yellow] No AI CLI found - install at least one")
+    
+    # Check agentic commands
+    console.print("\n[cyan]Agentic Commands:[/cyan]")
+    for cmd in ["agentic", "agentic-mcp", "agentic-worker-mcp"]:
+        if shutil.which(cmd):
+            console.print(f"  [green]✓[/green] {cmd}")
+        else:
+            console.print(f"  [yellow]![/yellow] {cmd} not in PATH")
+    
+    # Check Redis (optional)
+    console.print("\n[cyan]Storage Backend:[/cyan]")
+    try:
+        import redis
+        r = redis.Redis(
+            host=os.environ.get("AGENTIC_REDIS_HOST", "localhost"),
+            port=int(os.environ.get("AGENTIC_REDIS_PORT", "6379")),
+        )
+        r.ping()
+        console.print("  [green]✓[/green] Redis available (will use Redis)")
+    except Exception:
+        console.print("  [dim]○[/dim] Redis not available (will use SQLite)")
+    
+    # Check current session
+    console.print("\n[cyan]Session Status:[/cyan]")
+    working_dir = os.getcwd()
+    session_id = get_current_session_id(working_dir)
+    if session_id:
+        console.print(f"  [green]●[/green] Active session: {session_id}")
+    else:
+        console.print("  [dim]○[/dim] No active session")
+    
+    # Check tmux session
+    if shutil.which("tmux"):
+        result = os.popen("tmux list-sessions 2>/dev/null").read().strip()
+        if result:
+            sessions = result.split("\n")
+            for s in sessions[:3]:
+                console.print(f"  [dim]  tmux: {s.split(':')[0]}[/dim]")
+    
+    # Check MCP configuration
+    console.print("\n[cyan]MCP Configuration:[/cyan]")
+    
+    vscode_mcp = Path.home() / ".vscode" / "mcp" / "servers.json"
+    if vscode_mcp.exists():
+        console.print(f"  [green]✓[/green] VS Code: {vscode_mcp}")
+    else:
+        console.print("  [dim]○[/dim] VS Code MCP not configured")
+    
+    claude_config = Path.home() / ".config" / "claude" / "claude_desktop_config.json"
+    if claude_config.exists():
+        console.print(f"  [green]✓[/green] Claude Desktop: {claude_config}")
+    else:
+        console.print("  [dim]○[/dim] Claude Desktop not configured")
+    
+    # Summary
+    console.print()
+    if all_ok:
+        console.print("[green]All critical checks passed![/green]")
+    else:
+        console.print("[yellow]Some issues found. Run 'agentic setup' to fix.[/yellow]")
 
 
 if __name__ == "__main__":
