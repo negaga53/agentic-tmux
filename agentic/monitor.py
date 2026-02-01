@@ -7,6 +7,10 @@ Features:
 - Arrow key navigation between agents/orchestrator
 - Message details for selected entity
 - Real-time activity log
+- Send messages to agents/orchestrator
+- Terminate all workers
+- Interrupt and request status reports
+- Detect when agents/orchestrator are not running
 
 Usage:
     agentic monitor
@@ -14,6 +18,10 @@ Usage:
     
 Controls:
     ↑/↓ or j/k: Navigate between agents
+    m: Send message to selected agent
+    t: Terminate all workers
+    i: Interrupt all - request immediate reports
+    e: Toggle expanded view
     q: Quit
 """
 
@@ -48,6 +56,7 @@ from agentic.config import (
 )
 from agentic.models import SessionStatus
 from agentic.redis_client import get_client
+from agentic.tmux_manager import TmuxManager
 
 
 console = Console()
@@ -171,6 +180,14 @@ class MonitorState:
     session_ended: bool = False
     end_reason: str = ""
     expanded_view: bool = False  # Show full messages without truncation
+    # Input mode state
+    input_mode: bool = False  # True when collecting user input
+    input_prompt: str = ""  # Prompt to display
+    input_buffer: str = ""  # Currently typed text
+    input_callback: str = ""  # Action to perform on Enter (send_message, etc.)
+    # Status message (shown briefly)
+    status_message: str = ""
+    status_time: float = 0.0
 
 
 # =============================================================================
@@ -276,6 +293,218 @@ def format_timestamp(ts: float) -> str:
 
 
 # =============================================================================
+# Agent Liveness Detection
+# =============================================================================
+
+def check_agent_liveness(storage: Any, session_id: str) -> dict[str, dict[str, Any]]:
+    """Check if agents' tmux panes are still running.
+    
+    Returns a dict mapping agent_id to liveness info:
+        {
+            "agent_id": {
+                "pane_exists": bool,
+                "is_running": bool,  # pane exists and has an active command
+                "current_command": str | None,
+            }
+        }
+    """
+    agents = storage.get_all_agents(session_id)
+    liveness = {}
+    
+    try:
+        tmux = TmuxManager()
+        if not tmux.session_exists():
+            # Session gone, all agents dead
+            for agent in agents:
+                liveness[agent.id] = {
+                    "pane_exists": False,
+                    "is_running": False,
+                    "current_command": None,
+                }
+            return liveness
+        
+        # Get all panes in the session
+        all_panes = tmux.list_all_panes()
+        pane_lookup = {p.pane_id: p for p in all_panes}
+        
+        for agent in agents:
+            pane_id = agent.pane_id
+            if not pane_id or pane_id not in pane_lookup:
+                liveness[agent.id] = {
+                    "pane_exists": False,
+                    "is_running": False,
+                    "current_command": None,
+                }
+            else:
+                pane_info = pane_lookup[pane_id]
+                cmd = pane_info.current_command or ""
+                # Check if command indicates active work (copilot, claude, etc.)
+                # If the pane shows bash/zsh/sh, the CLI likely exited
+                is_active_cli = any(cli in cmd.lower() for cli in ["copilot", "claude", "aider", "node", "python"])
+                liveness[agent.id] = {
+                    "pane_exists": True,
+                    "is_running": is_active_cli,
+                    "current_command": cmd,
+                }
+    except Exception:
+        # Tmux not available or error
+        for agent in agents:
+            liveness[agent.id] = {
+                "pane_exists": None,  # Unknown
+                "is_running": None,
+                "current_command": None,
+            }
+    
+    return liveness
+
+
+def check_orchestrator_liveness(working_dir: str) -> dict[str, Any]:
+    """Check if the orchestrator process is running.
+    
+    Returns:
+        {
+            "pid": int | None,
+            "is_running": bool,
+        }
+    """
+    from agentic.config import get_pid_file
+    
+    pid_file = get_pid_file(working_dir)
+    if not pid_file.exists():
+        return {"pid": None, "is_running": False}
+    
+    try:
+        pid = int(pid_file.read_text().strip())
+        # Check if process exists
+        import os
+        os.kill(pid, 0)  # Signal 0 just checks if process exists
+        return {"pid": pid, "is_running": True}
+    except (ValueError, ProcessLookupError, PermissionError):
+        return {"pid": None, "is_running": False}
+
+
+# =============================================================================
+# Admin Commands
+# =============================================================================
+
+def send_message_to_entity(
+    storage: Any,
+    session_id: str,
+    entity_id: str,
+    message: str,
+    working_dir: str,
+) -> bool:
+    """Send a message to an agent or orchestrator.
+    
+    Args:
+        storage: Storage client
+        session_id: Session ID
+        entity_id: Target agent ID or "orchestrator"
+        message: Message to send
+        working_dir: Working directory for logging
+    
+    Returns:
+        True if successful.
+    """
+    try:
+        msg_id = storage.send_agent_message(
+            session_id=session_id,
+            from_agent="admin",
+            to_agent=entity_id,
+            message=message,
+        )
+        
+        # Log message sent
+        log_activity("message_sent", {
+            "from": "admin",
+            "to": entity_id,
+            "message_preview": message[:500],
+        }, session_id=session_id, working_dir=working_dir)
+        
+        return True
+    except Exception:
+        return False
+
+
+def terminate_all_workers(storage: Any, session_id: str, working_dir: str) -> int:
+    """Send TERMINATE to all agents and mark session as done.
+    
+    Returns:
+        Number of agents terminated.
+    """
+    agents = storage.get_all_agents(session_id)
+    
+    terminated = 0
+    for agent in agents:
+        try:
+            storage.send_agent_message(
+                session_id=session_id,
+                from_agent="admin",
+                to_agent=agent.id,
+                message="TERMINATE",
+            )
+            terminated += 1
+            
+            # Log agent terminate
+            log_activity("agent_terminate", {
+                "agent_id": agent.id,
+            }, session_id=session_id, working_dir=working_dir)
+        except Exception:
+            pass
+    
+    # Mark session as done
+    storage.push_done_to_all(session_id)
+    
+    return terminated
+
+
+def interrupt_and_report(storage: Any, session_id: str, working_dir: str) -> int:
+    """Send interrupt signal to all workers telling them to report and exit.
+    
+    This sends a special message instructing agents to:
+    1. Stop what they're doing
+    2. Send their current progress/results to the orchestrator
+    3. Exit gracefully
+    
+    Returns:
+        Number of agents messaged.
+    """
+    agents = storage.get_all_agents(session_id)
+    
+    interrupt_message = """INTERRUPT: Session admin has requested an immediate status report.
+
+REQUIRED ACTIONS:
+1. STOP any current work immediately
+2. Compile your current progress, partial results, or status
+3. Send a report to orchestrator using: send_to_agent(agent_id="orchestrator", message="<your progress report>")
+4. After sending the report, exit gracefully
+
+This is an administrative interrupt. Comply immediately."""
+    
+    messaged = 0
+    for agent in agents:
+        try:
+            storage.send_agent_message(
+                session_id=session_id,
+                from_agent="admin",
+                to_agent=agent.id,
+                message=interrupt_message,
+            )
+            messaged += 1
+            
+            # Log the interrupt
+            log_activity("message_sent", {
+                "from": "admin",
+                "to": agent.id,
+                "message_preview": "INTERRUPT: Request immediate status report",
+            }, session_id=session_id, working_dir=working_dir)
+        except Exception:
+            pass
+    
+    return messaged
+
+
+# =============================================================================
 # Panel Builders
 # =============================================================================
 
@@ -301,10 +530,19 @@ def build_header_panel(state: MonitorState, session: Any, start_time: float) -> 
     header_text.append(f"{status_text}  ", style=status_style)
     header_text.append("Uptime: ", style="bold")
     header_text.append(f"{uptime_str}  ", style="dim")
-    expand_hint = "[e] Collapse" if state.expanded_view else "[e] Expand"
-    header_text.append(f"[↑↓/jk] Navigate  {expand_hint}  [q] Quit", style="dim italic")
     
-    return Panel(header_text, title="[bold blue]AGENTIC MONITOR[/bold blue]", border_style="blue", height=3)
+    # Show status message if recent (within 3 seconds)
+    if state.status_message and (time.time() - state.status_time) < 3.0:
+        header_text.append(f"\n{state.status_message}", style="yellow bold")
+    elif state.input_mode:
+        header_text.append(f"\n{state.input_prompt}: ", style="yellow bold")
+        header_text.append(state.input_buffer, style="white")
+        header_text.append("█", style="white blink")
+    else:
+        expand_hint = "[e] Collapse" if state.expanded_view else "[e] Expand"
+        header_text.append(f"\n[↑↓] Navigate  [m] Message  [t] Terminate  [i] Interrupt  {expand_hint}  [q] Quit", style="dim italic")
+    
+    return Panel(header_text, title="[bold blue]AGENTIC MONITOR[/bold blue]", border_style="blue", height=4)
 
 
 def build_entities_table(storage: Any, state: MonitorState) -> Table:
@@ -356,6 +594,14 @@ def build_entities_table(storage: Any, state: MonitorState) -> Table:
             status_text = Text("work", style=f"green {row_style}")
         elif status == "idle":
             status_text = Text("idle", style=f"dim {row_style}")
+        elif status == "polling":
+            status_text = Text("poll", style=f"cyan {row_style}")
+        elif status == "waiting":
+            status_text = Text("wait", style=f"yellow {row_style}")
+        elif status == "failed":
+            status_text = Text("fail", style=f"red {row_style}")
+        elif status == "done":
+            status_text = Text("done", style=f"blue {row_style}")
         else:
             status_text = Text(status[:4], style=row_style)
         
@@ -533,6 +779,13 @@ def build_activity_log_panel(session_id: str, max_lines: int = 50, expanded: boo
                 content.append(f"{time_str} ", style="dim")
                 content.append("RECV  ", style="blue bold")
                 content.append(f"{agent_id}←{from_agent}\n", style="blue")
+            elif event == "polling_start":
+                agent_id = entry.get("agent_id", "?")
+                timeout = entry.get("timeout", "?")
+                content.append(f"{time_str} ", style="dim")
+                content.append("POLL  ", style="cyan bold")
+                content.append(f"{agent_id}", style="cyan")
+                content.append(f" waiting {timeout}s\n", style="dim")
             elif event == "error":
                 raw_msg = entry.get("message", "unknown error")
                 msg = raw_msg if expanded else truncate_text(raw_msg, 60)
@@ -556,8 +809,18 @@ def build_health_panel(storage: Any, state: MonitorState) -> Panel:
     agents = storage.get_all_agents(state.session_id)
     current_time = time.time()
     
+    # Check agent liveness via tmux
+    liveness = check_agent_liveness(storage, state.session_id)
+    
+    # Check orchestrator liveness
+    orch_liveness = check_orchestrator_liveness(state.working_dir)
+    
     # Only check health if session is running
     if not state.session_ended:
+        # Check orchestrator
+        if not orch_liveness["is_running"]:
+            issues.append(Text("✖ Orchestrator not running", style="red bold"))
+        
         # Check for stale heartbeats
         for agent in agents:
             age = current_time - agent.last_heartbeat
@@ -568,6 +831,13 @@ def build_health_panel(storage: Any, state: MonitorState) -> Panel:
         for agent in agents:
             if agent.task_queue_length > 5:
                 issues.append(Text(f"⚠ {agent.id} backlog ({agent.task_queue_length})", style="yellow"))
+        
+        # Check for dead agent panes
+        for agent_id, info in liveness.items():
+            if info["pane_exists"] is False:
+                issues.append(Text(f"✖ {agent_id} pane gone", style="red"))
+            elif info["is_running"] is False and info["pane_exists"]:
+                issues.append(Text(f"⚠ {agent_id} CLI exited", style="yellow"))
     
     # Session status
     session = storage.get_session(state.session_id)
@@ -610,7 +880,7 @@ def build_dashboard(storage: Any, state: MonitorState, start_time: float) -> Lay
     
     # Main vertical split: header, top row (agents+health), bottom row (activity+messages)
     layout.split_column(
-        Layout(name="header", size=3),
+        Layout(name="header", size=4),
         Layout(name="top", size=10),
         Layout(name="bottom"),
     )
@@ -722,6 +992,49 @@ def run_monitor(refresh_rate: float = 1.0) -> None:
                         agents = storage.get_all_agents(state.session_id)
                         max_index = len(agents)  # 0 = orchestrator, 1..n = agents
                         
+                        # Input mode handling
+                        if state.input_mode:
+                            if key == '\x1b' or key == 'ESC':  # Escape - cancel input
+                                state.input_mode = False
+                                state.input_buffer = ""
+                                state.input_callback = ""
+                                needs_render = True
+                            elif key == '\r' or key == '\n':  # Enter - submit input
+                                if state.input_buffer.strip():
+                                    # Execute the callback action
+                                    if state.input_callback == "send_message":
+                                        # Determine target entity
+                                        if state.selected_index == 0:
+                                            target_id = "orchestrator"
+                                        else:
+                                            sorted_agents = sorted(agents, key=lambda a: a.id)
+                                            agent_index = state.selected_index - 1
+                                            if agent_index < len(sorted_agents):
+                                                target_id = sorted_agents[agent_index].id
+                                            else:
+                                                target_id = "orchestrator"
+                                        
+                                        if send_message_to_entity(storage, state.session_id, target_id, state.input_buffer, state.working_dir):
+                                            state.status_message = f"✓ Sent to {target_id}"
+                                            state.status_time = time.time()
+                                        else:
+                                            state.status_message = f"✖ Failed to send to {target_id}"
+                                            state.status_time = time.time()
+                                
+                                state.input_mode = False
+                                state.input_buffer = ""
+                                state.input_callback = ""
+                                needs_render = True
+                            elif key == '\x7f' or key == '\b':  # Backspace
+                                if state.input_buffer:
+                                    state.input_buffer = state.input_buffer[:-1]
+                                    needs_render = True
+                            elif len(key) == 1 and key.isprintable():  # Regular character
+                                state.input_buffer += key
+                                needs_render = True
+                            continue
+                        
+                        # Normal mode key handling
                         if key in ('q', 'Q', '\x03'):  # q or Ctrl+C
                             state.running = False
                             continue
@@ -737,6 +1050,34 @@ def run_monitor(refresh_rate: float = 1.0) -> None:
                                 needs_render = True
                         elif key in ('e', 'E'):
                             state.expanded_view = not state.expanded_view
+                            needs_render = True
+                        elif key in ('m', 'M'):
+                            # Send message to selected entity
+                            if state.selected_index == 0:
+                                target = "orchestrator"
+                            else:
+                                sorted_agents = sorted(agents, key=lambda a: a.id)
+                                agent_index = state.selected_index - 1
+                                if agent_index < len(sorted_agents):
+                                    target = sorted_agents[agent_index].id
+                                else:
+                                    target = "orchestrator"
+                            state.input_mode = True
+                            state.input_prompt = f"Message to {target} (ESC=cancel)"
+                            state.input_buffer = ""
+                            state.input_callback = "send_message"
+                            needs_render = True
+                        elif key in ('t', 'T'):
+                            # Terminate all workers
+                            count = terminate_all_workers(storage, state.session_id, state.working_dir)
+                            state.status_message = f"✓ Terminated {count} agents"
+                            state.status_time = time.time()
+                            needs_render = True
+                        elif key in ('i', 'I'):
+                            # Interrupt and request reports
+                            count = interrupt_and_report(storage, state.session_id, state.working_dir)
+                            state.status_message = f"✓ Interrupt sent to {count} agents"
+                            state.status_time = time.time()
                             needs_render = True
                 
                 # Check session status and refresh data periodically

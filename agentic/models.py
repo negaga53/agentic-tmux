@@ -16,6 +16,7 @@ class AgentStatus(str, Enum):
     IDLE = "idle"
     WORKING = "working"
     WAITING = "waiting"
+    POLLING = "polling"  # Waiting for messages in receive_message loop
     FAILED = "failed"
     DONE = "done"
 

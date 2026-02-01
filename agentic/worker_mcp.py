@@ -184,23 +184,37 @@ def receive_message(
             "reason": "Session has been marked as done by orchestrator",
         }
     
+    # Update status to POLLING so monitor knows we're waiting for messages
+    storage.update_agent_status(session_id, agent_id, "polling")
+    
+    # Log polling start
+    log_activity("polling_start", {
+        "agent_id": agent_id,
+        "timeout": timeout,
+    }, session_id=session_id, working_dir=_get_working_dir())
+    
     # Try to receive a message
     msg = storage.receive_agent_message(session_id, agent_id, timeout=timeout)
     
     if not msg:
         # Check session done status again after waiting
         if storage.is_session_done(session_id):
+            storage.update_agent_status(session_id, agent_id, "idle")
             return {
                 "status": "session_terminated",
                 "agent_id": agent_id,
                 "message": "TERMINATE",
                 "reason": "Session has been marked as done by orchestrator",
             }
+        # Still polling - status remains POLLING since we'll be called again
         return {
             "status": "no_message",
             "agent_id": agent_id,
             "waited_seconds": timeout,
         }
+    
+    # Update status to WORKING since we have a message to process
+    storage.update_agent_status(session_id, agent_id, "working")
     
     # Log message received
     log_activity("message_received", {

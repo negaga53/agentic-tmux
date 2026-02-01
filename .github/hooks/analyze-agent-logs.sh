@@ -25,12 +25,34 @@ fi
 # Event counts
 echo "Event Summary:"
 echo "--------------"
-jq -r '.event' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null | sort | uniq -c | sort -rn
+python3 -c "
+import json, sys
+from collections import Counter
+events = Counter()
+for line in open('$LOGDIR/agent-timeline.jsonl'):
+    try:
+        events[json.loads(line).get('event', '')] += 1
+    except: pass
+for event, count in sorted(events.items(), key=lambda x: -x[1]):
+    print(f'  {count:4d} {event}')
+" 2>/dev/null
 
 echo ""
 echo "MCP Tool Calls:"
 echo "---------------"
-MCP_CALLS=$(jq -r 'select(.isMcpTool == true) | .toolName' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null | sort | uniq -c | sort -rn)
+MCP_CALLS=$(python3 -c "
+import json, sys
+from collections import Counter
+tools = Counter()
+for line in open('$LOGDIR/agent-timeline.jsonl'):
+    try:
+        d = json.loads(line)
+        if d.get('isMcpTool') == True and d.get('toolName'):
+            tools[d['toolName']] += 1
+    except: pass
+for tool, count in sorted(tools.items(), key=lambda x: -x[1]):
+    print(f'  {count:4d} {tool}')
+" 2>/dev/null)
 if [ -n "$MCP_CALLS" ]; then
     echo "$MCP_CALLS"
 else
@@ -41,14 +63,26 @@ fi
 echo ""
 echo "Non-MCP Tool Calls:"
 echo "-------------------"
-jq -r 'select(.event == "PRE_TOOL_USE" and .isMcpTool == false) | .toolName' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null | sort | uniq -c | sort -rn
+python3 -c "
+import json, sys
+from collections import Counter
+tools = Counter()
+for line in open('$LOGDIR/agent-timeline.jsonl'):
+    try:
+        d = json.loads(line)
+        if d.get('event') == 'PRE_TOOL_USE' and d.get('isMcpTool') == False and d.get('toolName'):
+            tools[d['toolName']] += 1
+    except: pass
+for tool, count in sorted(tools.items(), key=lambda x: -x[1]):
+    print(f'  {count:4d} {tool}')
+" 2>/dev/null
 
 echo ""
 echo "Protocol Compliance Check:"
 echo "--------------------------"
-LIST_AGENTS=$(jq -r 'select(.toolName | test("list_agents")) | .toolName' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null | wc -l)
-SEND_TO=$(jq -r 'select(.toolName | test("send_to_agent")) | .toolName' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null | wc -l)
-RECEIVE=$(jq -r 'select(.toolName | test("receive_message")) | .toolName' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null | wc -l)
+LIST_AGENTS=$(grep -c '"list_agents"' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null || echo 0)
+SEND_TO=$(grep -c '"send_to_agent"' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null || echo 0)
+RECEIVE=$(grep -c '"receive_message"' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null || echo 0)
 
 if [ "$LIST_AGENTS" -gt 0 ]; then
     echo "  [OK] list_agents() called ($LIST_AGENTS times)"
@@ -71,10 +105,18 @@ fi
 echo ""
 echo "Errors:"
 echo "-------"
-ERROR_COUNT=$(jq -r 'select(.event == "ERROR_OCCURRED")' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null | wc -l)
+ERROR_COUNT=$(grep -c '"ERROR_OCCURRED"' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null || echo 0)
 if [ "$ERROR_COUNT" -gt 0 ]; then
     echo "  $ERROR_COUNT errors occurred:"
-    jq -r 'select(.event == "ERROR_OCCURRED") | "  - \(.errorName): \(.errorMessage)"' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null
+    python3 -c "
+import json
+for line in open('$LOGDIR/agent-timeline.jsonl'):
+    try:
+        d = json.loads(line)
+        if d.get('event') == 'ERROR_OCCURRED':
+            print(f\"  - {d.get('errorName', 'Unknown')}: {d.get('errorMessage', 'No message')}\")
+    except: pass
+" 2>/dev/null
 else
     echo "  No errors recorded"
 fi
@@ -82,13 +124,20 @@ fi
 echo ""
 echo "Timeline (last 20 events):"
 echo "--------------------------"
-jq -r '[.event, .toolName // .reason // ""] | @tsv' "$LOGDIR/agent-timeline.jsonl" 2>/dev/null | tail -20 | while read event tool; do
-    if [ -n "$tool" ]; then
-        echo "  $event: $tool"
-    else
-        echo "  $event"
-    fi
-done
+python3 -c "
+import json
+lines = open('$LOGDIR/agent-timeline.jsonl').readlines()
+for line in lines[-20:]:
+    try:
+        d = json.loads(line)
+        event = d.get('event', '')
+        detail = d.get('toolName') or d.get('reason') or ''
+        if detail:
+            print(f'  {event}: {detail}')
+        else:
+            print(f'  {event}')
+    except: pass
+" 2>/dev/null
 
 echo ""
 echo "========================================"
