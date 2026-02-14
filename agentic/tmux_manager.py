@@ -16,6 +16,8 @@ from agentic.models import Agent
 
 
 # AGENTS.md content - loaded into system context by Copilot CLI
+# NOTE: This is agent-agnostic; each agent discovers its own ID via the
+# get_my_info() MCP tool or the AGENTIC_AGENT_ID environment variable.
 AGENTS_MD_CONTENT = '''# Multi-Agent Communication Protocol
 
 You are a worker agent in a coordinated multi-agent system. You MUST follow
@@ -23,7 +25,8 @@ this protocol EXACTLY. Failure to comply will cause task failure.
 
 ## CRITICAL: Your Role
 
-You are agent **{agent_id}**. Your results are ONLY delivered via MCP tools.
+Your agent ID is set in the AGENTIC_AGENT_ID environment variable.
+Your results are ONLY delivered via MCP tools.
 Text responses are NOT visible to other agents or the orchestrator.
 
 ## Available MCP Tools (USE THESE)
@@ -67,11 +70,11 @@ Perform your assigned task. Stay within your file scope.
 ```
 send_to_agent(
     agent_id="orchestrator",
-    message=json.dumps({{
+    message=json.dumps({
         "status": "complete",
-        "agent_id": "{agent_id}",
+        "agent_id": "<your agent ID>",
         "result": "<your results here>"
-    }})
+    })
 )
 ```
 ⚠️ If you skip this step, your work is LOST. The orchestrator will never
@@ -226,30 +229,26 @@ class TmuxManager:
         
         return pane.id
 
-    def _write_agents_md(self, working_dir: str, agent_id: str) -> None:
+    def _write_agents_md(self, working_dir: str) -> None:
         """
-        Write AGENTS.md file to working directory.
+        Write AGENTS.md file to working directory (once).
         
         This file is automatically loaded into system context by Copilot CLI,
-        providing mandatory communication protocol instructions.
+        providing mandatory communication protocol instructions.  The content
+        is agent-agnostic; each agent discovers its own ID via the
+        AGENTIC_AGENT_ID env var or the get_my_info() MCP tool.
         """
         agents_md_path = Path(working_dir) / "AGENTS.md"
-        content = AGENTS_MD_CONTENT.format(agent_id=agent_id)
         
         try:
-            # Only write if doesn't exist or content differs
+            # Only write if it doesn't already exist
             if not agents_md_path.exists():
-                agents_md_path.write_text(content)
-            else:
-                existing = agents_md_path.read_text()
-                # Update if agent_id placeholder needs updating
-                if f"agent **{agent_id}**" not in existing:
-                    agents_md_path.write_text(content)
+                agents_md_path.write_text(AGENTS_MD_CONTENT)
         except Exception as e:
             # Log but don't fail - the inline instructions are backup
-            from pathlib import Path as P
-            debug_file = P.home() / ".config" / "agentic" / "agents_md_errors.log"
-            debug_file.parent.mkdir(parents=True, exist_ok=True)
+            debug_dir = Path(working_dir) / ".agentic"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            debug_file = debug_dir / "agents_md_errors.log"
             with open(debug_file, "a") as f:
                 f.write(f"{time.time()}: Failed to write AGENTS.md: {e}\n")
 
@@ -275,7 +274,7 @@ class TmuxManager:
             Pane ID of the new worker pane.
         """
         # Write AGENTS.md with protocol instructions (loaded into system context)
-        self._write_agents_md(working_dir, agent.id)
+        self._write_agents_md(working_dir)
         
         # Find the admin window or create worker window
         worker_window = None

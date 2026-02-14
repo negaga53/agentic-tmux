@@ -8,6 +8,7 @@ and other MCP clients.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -20,61 +21,25 @@ from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.table import Table
 
+from agentic import __version__
 from agentic.config import (
-    get_config_dir,
+    clear_current_session,
+    get_current_session_id,
     get_pid_file,
-    get_session_file,
+    get_storage_client,
 )
 from agentic.models import (
     SessionStatus,
     Task,
 )
 from agentic.orchestrator import stop_orchestrator
-from agentic.redis_client import get_client
 from agentic.tmux_manager import TmuxManager
 
 console = Console()
 
 
-def get_redis_client(working_dir: str | None = None):
-    """Get storage client (Redis preferred, SQLite fallback).
-    
-    Args:
-        working_dir: Working directory for per-repo storage. If None, uses CWD.
-    """
-    return get_client(
-        host=os.environ.get("AGENTIC_REDIS_HOST", "localhost"),
-        port=int(os.environ.get("AGENTIC_REDIS_PORT", "6379")),
-        db=int(os.environ.get("AGENTIC_REDIS_DB", "0")),
-        working_dir=working_dir,
-    )
-
-
-def get_current_session_id(working_dir: str | None = None) -> str | None:
-    """Get the current session ID if one exists.
-    
-    Args:
-        working_dir: Working directory to check. If None, uses CWD.
-    """
-    session_file = get_session_file(working_dir)
-    if session_file.exists():
-        return session_file.read_text().strip()
-    return os.environ.get("AGENTIC_SESSION_ID")
-
-
-def clear_current_session(working_dir: str | None = None) -> None:
-    """Clear the current session ID.
-    
-    Args:
-        working_dir: Working directory for per-repo storage. If None, uses CWD.
-    """
-    session_file = get_session_file(working_dir)
-    if session_file.exists():
-        session_file.unlink()
-
-
 @click.group()
-@click.version_option(version="0.1.0")
+@click.version_option(version=__version__)
 def main():
     """Agentic TMUX - Multi-agent orchestration for CLI coding assistants.
     
@@ -108,7 +73,7 @@ def status(watch: bool):
         console.print("[yellow]No active session[/yellow]")
         return
     
-    redis = get_redis_client(working_dir)
+    redis = get_storage_client(working_dir)
     
     if watch:
         with Live(console=console, refresh_per_second=0.5) as live:
@@ -190,7 +155,7 @@ def logs(agent_id: str, follow: bool, lines: int):
         console.print("[yellow]No active session[/yellow]")
         return
     
-    redis = get_redis_client(working_dir)
+    redis = get_storage_client(working_dir)
     
     # Get initial logs
     log_entries = redis.get_agent_logs(session_id, agent_id, count=lines)
@@ -229,7 +194,7 @@ def send(agent_id: str, task_description: str):
         console.print("[red]Error:[/red] No active session")
         sys.exit(1)
     
-    redis = get_redis_client(working_dir)
+    redis = get_storage_client(working_dir)
     
     task = Task(
         title=task_description[:50],
@@ -250,7 +215,7 @@ def stop():
         console.print("[yellow]No active session[/yellow]")
         return
     
-    redis = get_redis_client(working_dir)
+    redis = get_storage_client(working_dir)
     session = redis.get_session(session_id)
     if session:
         working_dir = session.working_directory
@@ -291,7 +256,7 @@ def clear(force: bool):
     if not force and not Confirm.ask("Kill all worker panes?"):
         return
     
-    redis = get_redis_client(working_dir)
+    redis = get_storage_client(working_dir)
     tmux = TmuxManager()
     
     # Send done signal
@@ -321,7 +286,7 @@ def export(output: str):
     
     import json
     
-    redis = get_redis_client(working_dir)
+    redis = get_storage_client(working_dir)
     session = redis.get_session(session_id)
     
     if not session:
@@ -387,7 +352,7 @@ def msg_send(to_agent: str, message: str):
         console.print("[red]Error:[/red] Agent ID not set (set AGENTIC_AGENT_ID)")
         sys.exit(1)
     
-    storage = get_redis_client(working_dir)
+    storage = get_storage_client(working_dir)
     
     # Verify target exists
     target = storage.get_agent(session_id, to_agent)
@@ -423,7 +388,7 @@ def msg_recv(timeout: int, raw: bool):
         console.print("[red]Error:[/red] Agent ID not set (set AGENTIC_AGENT_ID)")
         sys.exit(1)
     
-    storage = get_redis_client(working_dir)
+    storage = get_storage_client(working_dir)
     msg = storage.receive_agent_message(session_id, agent_id, timeout=timeout)
     
     if not msg:
@@ -458,7 +423,7 @@ def msg_list(raw: bool):
         console.print("[red]Error:[/red] No active session")
         sys.exit(1)
     
-    storage = get_redis_client(working_dir)
+    storage = get_storage_client(working_dir)
     agents = storage.get_all_agents(session_id)
     
     if raw:
@@ -725,8 +690,8 @@ def doctor():
     # Check tmux
     console.print("[cyan]System Requirements:[/cyan]")
     if shutil.which("tmux"):
-        result = os.popen("tmux -V").read().strip()
-        console.print(f"  [green]✓[/green] tmux: {result}")
+        result = subprocess.run(["tmux", "-V"], capture_output=True, text=True)
+        console.print(f"  [green]✓[/green] tmux: {result.stdout.strip()}")
     else:
         console.print("  [red]✗[/red] tmux not found")
         all_ok = False
@@ -790,9 +755,12 @@ def doctor():
     
     # Check tmux session
     if shutil.which("tmux"):
-        result = os.popen("tmux list-sessions 2>/dev/null").read().strip()
-        if result:
-            sessions = result.split("\n")
+        result = subprocess.run(
+            ["tmux", "list-sessions"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            sessions = result.stdout.strip().split("\n")
             for s in sessions[:3]:
                 console.print(f"  [dim]  tmux: {s.split(':')[0]}[/dim]")
     

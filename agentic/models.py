@@ -140,7 +140,8 @@ class TaskDAG(BaseModel):
             if task.status != TaskStatus.PENDING:
                 continue
             deps_satisfied = all(
-                self.tasks.get(dep_id, Task(id=dep_id, title="")).status == TaskStatus.COMPLETED
+                dep_id in self.tasks
+                and self.tasks[dep_id].status == TaskStatus.COMPLETED
                 for dep_id in task.dependencies
             )
             if deps_satisfied:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from agentic.models import Agent, Task, TaskDAG, TaskStatus
@@ -146,7 +147,7 @@ def get_parallel_groups(dag: TaskDAG) -> list[list[str]]:
 
 def detect_wait_cycle(
     agents: list[Agent],
-    get_waiting_for: callable,
+    get_waiting_for: Callable[[Agent], str | None],
 ) -> list[str] | None:
     """
     Detect if there's a circular wait among agents.

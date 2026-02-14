@@ -2,11 +2,16 @@
 
 This module provides per-repository config directories (.agentic/) instead of
 a centralized ~/.config/agentic/ folder. Each repo gets isolated storage.
+
+Also provides shared session/storage helpers used across CLI, MCP server,
+and monitor modules to avoid code duplication.
 """
 
-from pathlib import Path
-import shutil
+from __future__ import annotations
+
 import os
+import shutil
+from pathlib import Path
 
 # Default config folder name (hidden)
 CONFIG_FOLDER_NAME = ".agentic"
@@ -57,9 +62,11 @@ def get_debug_log(working_dir: str | Path | None = None, name: str = "debug") ->
 
 
 def ensure_config_dir(working_dir: str | Path | None = None) -> Path:
-    """Ensure the config directory exists and return its path."""
+    """Ensure the config directory and subdirectories exist and return the config path."""
     config_dir = get_config_dir(working_dir)
     config_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = config_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
     return config_dir
 
 
@@ -128,3 +135,72 @@ WORKING_DIR_ENV_VAR = "AGENTIC_WORKING_DIR"
 def get_working_dir_from_env() -> str | None:
     """Get working directory from environment variable (used by workers)."""
     return os.environ.get(WORKING_DIR_ENV_VAR)
+
+
+def resolve_working_dir(working_dir: str | None = None) -> str:
+    """Resolve working directory from argument, env var, or CWD.
+
+    Priority: explicit arg > AGENTIC_WORKING_DIR env var > os.getcwd().
+    """
+    if working_dir is not None:
+        return working_dir
+    return os.environ.get(WORKING_DIR_ENV_VAR) or os.getcwd()
+
+
+def get_current_session_id(working_dir: str | None = None) -> str | None:
+    """Get the current session ID if one exists.
+
+    Checks the per-repo session file first, then the environment variable.
+
+    Args:
+        working_dir: Working directory to check. If None, resolved automatically.
+    """
+    working_dir = resolve_working_dir(working_dir)
+    session_file = get_session_file(working_dir)
+    if session_file.exists():
+        return session_file.read_text().strip()
+    return os.environ.get("AGENTIC_SESSION_ID")
+
+
+def save_current_session_id(session_id: str, working_dir: str | None = None) -> None:
+    """Save the current session ID to the per-repo session file.
+
+    Args:
+        session_id: The session ID to save.
+        working_dir: Working directory for per-repo storage. If None, resolved automatically.
+    """
+    working_dir = resolve_working_dir(working_dir)
+    ensure_config_dir(working_dir)
+    session_file = get_session_file(working_dir)
+    session_file.write_text(session_id)
+
+
+def clear_current_session(working_dir: str | None = None) -> None:
+    """Clear the current session ID.
+
+    Args:
+        working_dir: Working directory for per-repo storage. If None, resolved automatically.
+    """
+    working_dir = resolve_working_dir(working_dir)
+    session_file = get_session_file(working_dir)
+    if session_file.exists():
+        session_file.unlink()
+
+
+def get_storage_client(working_dir: str | None = None):
+    """Get storage client (Redis preferred, SQLite fallback).
+
+    Lazily imports redis_client to avoid circular imports.
+
+    Args:
+        working_dir: Working directory for per-repo storage. If None, resolved automatically.
+    """
+    working_dir = resolve_working_dir(working_dir)
+    from agentic.redis_client import get_client
+
+    return get_client(
+        host=os.environ.get("AGENTIC_REDIS_HOST", "localhost"),
+        port=int(os.environ.get("AGENTIC_REDIS_PORT", "6379")),
+        db=int(os.environ.get("AGENTIC_REDIS_DB", "0")),
+        working_dir=working_dir,
+    )

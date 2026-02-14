@@ -66,7 +66,7 @@ if command -v copilot &> /dev/null; then
     echo -e "  ${GREEN}✓${NC} GitHub Copilot CLI"
     HAS_CLI=true
 else
-    echo -e "  ${YELLOW}○${NC} GitHub Copilot CLI - npm install -g @anthropic-ai/claude-code"
+    echo -e "  ${YELLOW}○${NC} GitHub Copilot CLI - npm install -g @githubnext/github-copilot-cli"
 fi
 
 if command -v claude &> /dev/null; then

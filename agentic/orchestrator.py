@@ -365,6 +365,7 @@ def start_orchestrator_background(
     redis_host: str = "localhost",
     redis_port: int = 6379,
     log_file: str | None = None,
+    working_dir: str | None = None,
 ) -> int | None:
     """
     Start the orchestrator as a background process.
@@ -381,6 +382,9 @@ def start_orchestrator_background(
         "--redis-host", redis_host,
         "--redis-port", str(redis_port),
     ]
+    
+    if working_dir:
+        cmd.extend(["--working-dir", working_dir])
     
     if log_file:
         with open(log_file, "w") as f:
@@ -440,8 +444,13 @@ if __name__ == "__main__":
     parser.add_argument("--redis-port", type=int, default=6379, help="Redis port")
     parser.add_argument("--log-level", default="INFO", help="Log level")
     parser.add_argument("--pid-file", help="PID file path")
+    parser.add_argument("--working-dir", help="Working directory for per-repo storage")
     
     args = parser.parse_args()
+    
+    # Set working dir environment variable so storage can find the right DB
+    if args.working_dir:
+        os.environ["AGENTIC_WORKING_DIR"] = args.working_dir
     
     run_orchestrator(
         session_id=args.session_id,

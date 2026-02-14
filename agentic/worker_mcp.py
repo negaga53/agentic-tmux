@@ -27,15 +27,18 @@ from pydantic import Field
 from agentic.config import (
     get_debug_log,
     ensure_config_dir,
+    resolve_working_dir,
+    get_storage_client as _get_storage_client,
     WORKING_DIR_ENV_VAR,
 )
+from agentic.models import AgentStatus
 from agentic.redis_client import get_client
 from agentic.monitor import log_activity
 
 
 def _get_working_dir() -> str:
     """Get working directory from environment or CWD."""
-    return os.environ.get(WORKING_DIR_ENV_VAR) or os.getcwd()
+    return resolve_working_dir()
 
 
 def _log_debug(msg: str) -> None:
@@ -49,13 +52,7 @@ def _log_debug(msg: str) -> None:
 
 def get_storage():
     """Get storage client."""
-    working_dir = _get_working_dir()
-    return get_client(
-        host=os.environ.get("AGENTIC_REDIS_HOST", "localhost"),
-        port=int(os.environ.get("AGENTIC_REDIS_PORT", "6379")),
-        db=int(os.environ.get("AGENTIC_REDIS_DB", "0")),
-        working_dir=working_dir,
-    )
+    return _get_storage_client(_get_working_dir())
 
 
 def get_session_info() -> tuple[str | None, str | None]:
@@ -185,7 +182,7 @@ def receive_message(
         }
     
     # Update status to POLLING so monitor knows we're waiting for messages
-    storage.update_agent_status(session_id, agent_id, "polling")
+    storage.set_agent_status(session_id, agent_id, AgentStatus.POLLING)
     
     # Log polling start
     log_activity("polling_start", {
@@ -199,7 +196,7 @@ def receive_message(
     if not msg:
         # Check session done status again after waiting
         if storage.is_session_done(session_id):
-            storage.update_agent_status(session_id, agent_id, "idle")
+            storage.set_agent_status(session_id, agent_id, AgentStatus.IDLE)
             return {
                 "status": "session_terminated",
                 "agent_id": agent_id,
@@ -214,7 +211,7 @@ def receive_message(
         }
     
     # Update status to WORKING since we have a message to process
-    storage.update_agent_status(session_id, agent_id, "working")
+    storage.set_agent_status(session_id, agent_id, AgentStatus.WORKING)
     
     # Log message received
     log_activity("message_received", {

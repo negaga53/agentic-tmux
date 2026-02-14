@@ -48,14 +48,14 @@ from rich.table import Table
 from rich.text import Text
 
 from agentic.config import (
-    get_config_dir,
-    get_session_file,
     get_activity_log,
+    get_current_session_id,
+    get_storage_client,
     ensure_config_dir,
+    resolve_working_dir,
     WORKING_DIR_ENV_VAR,
 )
 from agentic.models import SessionStatus
-from agentic.redis_client import get_client
 from agentic.tmux_manager import TmuxManager
 
 
@@ -78,7 +78,7 @@ def log_activity(
         event_type: Type of event (session_start, agent_spawn, etc.)
         details: Event details dict
         session_id: Optional session ID
-        working_dir: Working directory for per-repo storage. If None, uses CWD or env var.
+        working_dir: Working directory for per-repo storage. If None, resolved automatically.
     
     Event types:
         - session_start: Session started
@@ -90,9 +90,7 @@ def log_activity(
         - heartbeat: Heartbeat received (logged sparingly)
         - error: Error occurred
     """
-    # Get working_dir from env var if not provided (for workers)
-    if working_dir is None:
-        working_dir = os.environ.get(WORKING_DIR_ENV_VAR) or os.getcwd()
+    working_dir = resolve_working_dir(working_dir)
     
     config_dir = ensure_config_dir(working_dir)
     activity_log_file = get_activity_log(working_dir)
@@ -122,10 +120,9 @@ def read_activity_log(
     Args:
         max_entries: Maximum number of entries to return
         session_id: Optional filter by session ID
-        working_dir: Working directory. If None, uses CWD or env var.
+        working_dir: Working directory. If None, resolved automatically.
     """
-    if working_dir is None:
-        working_dir = os.environ.get(WORKING_DIR_ENV_VAR) or os.getcwd()
+    working_dir = resolve_working_dir(working_dir)
     
     activity_log_file = get_activity_log(working_dir)
     if not activity_log_file.exists():
@@ -156,10 +153,9 @@ def clear_activity_log(working_dir: str | None = None) -> None:
     """Clear the activity log file.
     
     Args:
-        working_dir: Working directory. If None, uses CWD or env var.
+        working_dir: Working directory. If None, resolved automatically.
     """
-    if working_dir is None:
-        working_dir = os.environ.get(WORKING_DIR_ENV_VAR) or os.getcwd()
+    working_dir = resolve_working_dir(working_dir)
     
     activity_log_file = get_activity_log(working_dir)
     if activity_log_file.exists():
@@ -247,37 +243,6 @@ def get_key_nonblocking() -> str | None:
 # =============================================================================
 # Helper Functions
 # =============================================================================
-
-def get_current_session_id(working_dir: str | None = None) -> str | None:
-    """Get the current session ID if one exists.
-    
-    Args:
-        working_dir: Working directory. If None, uses CWD or env var.
-    """
-    if working_dir is None:
-        working_dir = os.environ.get(WORKING_DIR_ENV_VAR) or os.getcwd()
-    
-    session_file = get_session_file(working_dir)
-    if session_file.exists():
-        return session_file.read_text().strip()
-    return os.environ.get("AGENTIC_SESSION_ID")
-
-
-def get_storage_client(working_dir: str | None = None):
-    """Get storage client (Redis preferred, SQLite fallback).
-    
-    Args:
-        working_dir: Working directory for per-repo storage. If None, uses CWD or env var.
-    """
-    if working_dir is None:
-        working_dir = os.environ.get(WORKING_DIR_ENV_VAR) or os.getcwd()
-    
-    return get_client(
-        host=os.environ.get("AGENTIC_REDIS_HOST", "localhost"),
-        port=int(os.environ.get("AGENTIC_REDIS_PORT", "6379")),
-        db=int(os.environ.get("AGENTIC_REDIS_DB", "0")),
-        working_dir=working_dir,
-    )
 
 
 def truncate_text(text: str, max_len: int = 40) -> str:

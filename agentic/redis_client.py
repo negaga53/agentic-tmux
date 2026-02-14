@@ -5,27 +5,27 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator, Generator
 
-from agentic.config import get_db_path, get_debug_log, ensure_config_dir, WORKING_DIR_ENV_VAR
+from agentic.config import get_db_path, get_debug_log, ensure_config_dir, resolve_working_dir, WORKING_DIR_ENV_VAR
 
 
 def _get_debug_log_path(working_dir: str | None = None) -> Path:
     """Get the debug log path for the given working directory."""
-    if working_dir is None:
-        working_dir = os.environ.get(WORKING_DIR_ENV_VAR) or os.getcwd()
-    return get_debug_log(working_dir, "sqlite_debug")
+    return get_debug_log(resolve_working_dir(working_dir), "sqlite_debug")
 
 
 def _log_debug(msg: str, working_dir: str | None = None) -> None:
     """Write debug message to log file."""
     debug_log = _get_debug_log_path(working_dir)
-    ensure_config_dir(working_dir)
+    ensure_config_dir(resolve_working_dir(working_dir))
     with open(debug_log, "a") as f:
         f.write(f"{time.time()}: {msg}\n")
 
@@ -38,12 +38,99 @@ from agentic.models import (
     AgentStatus,
     AgenticSession,
     ErrorReport,
+    FileScope,
     HeartbeatData,
     SessionStatus,
     Task,
     TaskDAG,
     TaskStatus,
 )
+
+
+def _serialize_hash(data: dict[str, Any]) -> dict[str, str]:
+    """Serialize dict values for hash/JSON storage.
+
+    Converts nested dicts/lists to JSON strings, None to empty string,
+    and everything else to str.
+    """
+    result: dict[str, str] = {}
+    for k, v in data.items():
+        if isinstance(v, (dict, list)):
+            result[k] = json.dumps(v)
+        elif v is None:
+            result[k] = ""
+        else:
+            result[k] = str(v)
+    return result
+
+
+def _serialize_plan(plan: Any) -> dict[str, Any]:
+    """Serialize an ExecutionPlan to a JSON-compatible dict.
+
+    Extracted to avoid duplication between Redis and SQLite clients.
+    """
+    return {
+        "prompt": plan.prompt,
+        "agents": [
+            {
+                "id": a.id,
+                "role": a.role,
+                "scope": {"patterns": a.scope.patterns, "read_only": a.scope.read_only},
+            }
+            for a in plan.agents
+        ],
+        "tasks": [
+            {
+                "id": t.id,
+                "title": t.title,
+                "description": t.description,
+                "agent_id": t.agent_id,
+                "dependencies": t.dependencies,
+                "files": t.files,
+            }
+            for t in plan.dag.tasks.values()
+        ],
+        "communications": plan.estimated_communications,
+    }
+
+
+def _deserialize_plan(plan_data: dict[str, Any]) -> Any:
+    """Deserialize a dict back into an ExecutionPlan.
+
+    Extracted to avoid duplication between Redis and SQLite clients.
+    """
+    from agentic.models import ExecutionPlan
+
+    agents = []
+    for a in plan_data.get("agents", []):
+        scope_data = a.get("scope", {})
+        agents.append(Agent(
+            id=a.get("id"),
+            role=a.get("role"),
+            scope=FileScope(
+                patterns=scope_data.get("patterns", ["**/*"]),
+                read_only=scope_data.get("read_only", False),
+            ),
+        ))
+
+    dag = TaskDAG()
+    for t in plan_data.get("tasks", []):
+        task = Task(
+            id=t.get("id", ""),
+            title=t.get("title", ""),
+            description=t.get("description", ""),
+            agent_id=t.get("agent_id"),
+            dependencies=t.get("dependencies", []),
+            files=t.get("files", []),
+        )
+        dag.add_task(task)
+
+    return ExecutionPlan(
+        prompt=plan_data.get("prompt", ""),
+        agents=agents,
+        dag=dag,
+        estimated_communications=plan_data.get("communications", []),
+    )
 
 
 class RedisKeys:
@@ -155,9 +242,6 @@ class SQLiteAgenticClient:
         try:
             yield cursor
             conn.commit()
-        except sqlite3.OperationalError as e:
-            conn.rollback()
-            raise
         except Exception:
             conn.rollback()
             raise
@@ -462,8 +546,6 @@ class SQLiteAgenticClient:
         for attempt in range(max_retries):
             try:
                 with self._transaction() as cur:
-                    # Use a random component to avoid collisions
-                    import random
                     cur.execute("SELECT MAX(idx) as max_idx FROM queues WHERE key = ?", (key,))
                     row = cur.fetchone()
                     base_idx = (row["max_idx"] or -1) + 1
@@ -539,7 +621,6 @@ class SQLiteAgenticClient:
         self, session_id: str, from_agent: str, to_agent: str, message: str
     ) -> str:
         """Send a message from one agent to another. Returns message ID."""
-        import random
         _log_debug(f"send_agent_message: {from_agent} -> {to_agent}, msg_len={len(message)}")
         key = RedisKeys.agent_messages(session_id, to_agent)
         msg_id = f"{int(time.time() * 1000)}-{from_agent}"
@@ -573,7 +654,8 @@ class SQLiteAgenticClient:
                 # Exponential backoff
                 time.sleep(0.1 * (2 ** attempt))
                 continue
-        return msg_id
+        # Should never reach here: loop returns on success or raises on last attempt
+        raise RuntimeError("send_agent_message: max retries exceeded")
 
     def receive_agent_message(
         self, session_id: str, agent_id: str, timeout: int = 0
@@ -674,7 +756,7 @@ class SQLiteAgenticClient:
     def log_action(self, session_id: str, agent_id: str, log: ActionLog) -> None:
         """Log an agent action."""
         key = RedisKeys.agent_log(session_id, agent_id)
-        entry_id = f"{int(time.time() * 1000)}-{id(log)}"
+        entry_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
         data = {
             "action": log.action,
             "details": json.dumps(log.details),
@@ -793,32 +875,8 @@ class SQLiteAgenticClient:
     # Pending plan operations
     def store_pending_plan(self, plan_id: str, plan: Any) -> None:
         """Store an execution plan temporarily for approval workflow."""
-        from agentic.models import ExecutionPlan
-        
         key = RedisKeys.pending_plan(plan_id)
-        plan_data = {
-            "prompt": plan.prompt,
-            "agents": [
-                {
-                    "id": a.id,
-                    "role": a.role,
-                    "scope": {"patterns": a.scope.patterns, "read_only": a.scope.read_only},
-                }
-                for a in plan.agents
-            ],
-            "tasks": [
-                {
-                    "id": t.id,
-                    "title": t.title,
-                    "description": t.description,
-                    "agent_id": t.agent_id,
-                    "dependencies": t.dependencies,
-                    "files": t.files,
-                }
-                for t in plan.dag.tasks.values()
-            ],
-            "communications": plan.estimated_communications,
-        }
+        plan_data = _serialize_plan(plan)
         expires_at = time.time() + 3600  # Expire after 1 hour
         with self._transaction() as cur:
             cur.execute(
@@ -828,8 +886,6 @@ class SQLiteAgenticClient:
 
     def get_pending_plan(self, plan_id: str) -> Any | None:
         """Retrieve a pending execution plan."""
-        from agentic.models import Agent, ExecutionPlan, FileScope, Task, TaskDAG
-        
         self._cleanup_expired()
         key = RedisKeys.pending_plan(plan_id)
         
@@ -841,36 +897,7 @@ class SQLiteAgenticClient:
             
             plan_data = json.loads(row["value"])
         
-        agents = []
-        for a in plan_data.get("agents", []):
-            scope_data = a.get("scope", {})
-            agents.append(Agent(
-                id=a.get("id"),
-                role=a.get("role"),
-                scope=FileScope(
-                    patterns=scope_data.get("patterns", ["**/*"]),
-                    read_only=scope_data.get("read_only", False),
-                ),
-            ))
-        
-        dag = TaskDAG()
-        for t in plan_data.get("tasks", []):
-            task = Task(
-                id=t.get("id", ""),
-                title=t.get("title", ""),
-                description=t.get("description", ""),
-                agent_id=t.get("agent_id"),
-                dependencies=t.get("dependencies", []),
-                files=t.get("files", []),
-            )
-            dag.add_task(task)
-        
-        return ExecutionPlan(
-            prompt=plan_data.get("prompt", ""),
-            agents=agents,
-            dag=dag,
-            estimated_communications=plan_data.get("communications", []),
-        )
+        return _deserialize_plan(plan_data)
 
     def delete_pending_plan(self, plan_id: str) -> None:
         """Delete a pending execution plan."""
@@ -878,17 +905,21 @@ class SQLiteAgenticClient:
         with self._transaction() as cur:
             cur.execute("DELETE FROM kv WHERE key = ?", (key,))
 
+    def all_queues_empty(self, session_id: str) -> bool:
+        """Check if all agent message queues are empty."""
+        agents = self.get_all_agents(session_id)
+        for agent in agents:
+            key = RedisKeys.agent_queue(session_id, agent.id)
+            with self._transaction() as cur:
+                cur.execute("SELECT COUNT(*) FROM queues WHERE key = ?", (key,))
+                count = cur.fetchone()[0]
+                if count > 0:
+                    return False
+        return True
+
     def _serialize_hash(self, data: dict[str, Any]) -> dict[str, str]:
         """Serialize dict values for storage."""
-        result = {}
-        for k, v in data.items():
-            if isinstance(v, (dict, list)):
-                result[k] = json.dumps(v)
-            elif v is None:
-                result[k] = ""
-            else:
-                result[k] = str(v)
-        return result
+        return _serialize_hash(data)
 
 
 # Singleton for SQLite storage (keyed by working_dir)
@@ -1363,95 +1394,39 @@ class AgenticRedisClient:
     # Pending plan operations (for MCP workflow)
     def store_pending_plan(self, plan_id: str, plan: Any) -> None:
         """Store an execution plan temporarily for approval workflow."""
-        from agentic.models import ExecutionPlan
-        
         key = RedisKeys.pending_plan(plan_id)
-        plan_data = {
-            "prompt": plan.prompt,
-            "agents": [
-                {
-                    "id": a.id,
-                    "role": a.role,
-                    "scope": {"patterns": a.scope.patterns, "read_only": a.scope.read_only},
-                }
-                for a in plan.agents
-            ],
-            "tasks": [
-                {
-                    "id": t.id,
-                    "title": t.title,
-                    "description": t.description,
-                    "agent_id": t.agent_id,
-                    "dependencies": t.dependencies,
-                    "files": t.files,
-                }
-                for t in plan.dag.tasks.values()
-            ],
-            "communications": plan.estimated_communications,
-        }
+        plan_data = _serialize_plan(plan)
         # Expire after 1 hour
         self.client.setex(key, 3600, json.dumps(plan_data))
 
     def get_pending_plan(self, plan_id: str) -> Any | None:
         """Retrieve a pending execution plan."""
-        from agentic.models import Agent, ExecutionPlan, FileScope, Task, TaskDAG
-        
         key = RedisKeys.pending_plan(plan_id)
         data = self.client.get(key)
         if not data:
             return None
         
         plan_data = json.loads(data)
-        
-        # Reconstruct the plan
-        agents = []
-        for a in plan_data.get("agents", []):
-            scope_data = a.get("scope", {})
-            agents.append(Agent(
-                id=a.get("id"),
-                role=a.get("role"),
-                scope=FileScope(
-                    patterns=scope_data.get("patterns", ["**/*"]),
-                    read_only=scope_data.get("read_only", False),
-                ),
-            ))
-        
-        dag = TaskDAG()
-        for t in plan_data.get("tasks", []):
-            task = Task(
-                id=t.get("id", ""),
-                title=t.get("title", ""),
-                description=t.get("description", ""),
-                agent_id=t.get("agent_id"),
-                dependencies=t.get("dependencies", []),
-                files=t.get("files", []),
-            )
-            dag.add_task(task)
-        
-        return ExecutionPlan(
-            prompt=plan_data.get("prompt", ""),
-            agents=agents,
-            dag=dag,
-            estimated_communications=plan_data.get("communications", []),
-        )
+        return _deserialize_plan(plan_data)
 
     def delete_pending_plan(self, plan_id: str) -> None:
         """Delete a pending execution plan."""
         key = RedisKeys.pending_plan(plan_id)
         self.client.delete(key)
 
+    def all_queues_empty(self, session_id: str) -> bool:
+        """Check if all agent message queues are empty."""
+        agents = self.get_all_agents(session_id)
+        for agent in agents:
+            queue_len = self.client.llen(RedisKeys.agent_queue(session_id, agent.id))
+            if queue_len > 0:
+                return False
+        return True
+
     # Utility
     def _serialize_hash(self, data: dict[str, Any]) -> dict[str, str]:
         """Serialize dict values for Redis hash storage."""
-        result = {}
-        for k, v in data.items():
-            if isinstance(v, (dict, list)):
-                result[k] = json.dumps(v)
-            elif v is None:
-                result[k] = ""
-            else:
-                result[k] = str(v)
-        return result
+        return _serialize_hash(data)
 
 
 class AsyncAgenticRedisClient:

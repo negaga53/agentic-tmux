@@ -24,11 +24,13 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from agentic.config import (
-    get_config_dir,
-    get_pid_file,
-    get_session_file,
+    clear_current_session,
     ensure_config_dir,
     cleanup_session_data,
+    get_current_session_id,
+    get_pid_file,
+    get_storage_client as _get_storage_client,
+    save_current_session_id,
     WORKING_DIR_ENV_VAR,
 )
 from agentic.models import (
@@ -39,7 +41,7 @@ from agentic.models import (
 )
 from agentic.monitor import log_activity
 from agentic.orchestrator import start_orchestrator_background, stop_orchestrator
-from agentic.redis_client import get_client, reset_sqlite_client
+from agentic.redis_client import reset_sqlite_client
 from agentic.tmux_manager import TmuxManager, check_tmux_available
 
 
@@ -49,47 +51,7 @@ def get_redis_client(working_dir: str | None = None):
     Args:
         working_dir: Working directory for per-repo storage. If None, uses CWD.
     """
-    return get_client(
-        host=os.environ.get("AGENTIC_REDIS_HOST", "localhost"),
-        port=int(os.environ.get("AGENTIC_REDIS_PORT", "6379")),
-        db=int(os.environ.get("AGENTIC_REDIS_DB", "0")),
-        working_dir=working_dir,
-    )
-
-
-def get_current_session_id(working_dir: str | None = None) -> str | None:
-    """Get the current session ID if one exists.
-    
-    Args:
-        working_dir: Working directory to check. If None, uses CWD.
-    """
-    session_file = get_session_file(working_dir)
-    if session_file.exists():
-        return session_file.read_text().strip()
-    return os.environ.get("AGENTIC_SESSION_ID")
-
-
-def save_current_session_id(session_id: str, working_dir: str | None = None) -> None:
-    """Save the current session ID.
-    
-    Args:
-        session_id: The session ID to save.
-        working_dir: Working directory for per-repo storage. If None, uses CWD.
-    """
-    ensure_config_dir(working_dir)
-    session_file = get_session_file(working_dir)
-    session_file.write_text(session_id)
-
-
-def clear_current_session(working_dir: str | None = None) -> None:
-    """Clear the current session ID.
-    
-    Args:
-        working_dir: Working directory for per-repo storage. If None, uses CWD.
-    """
-    session_file = get_session_file(working_dir)
-    if session_file.exists():
-        session_file.unlink()
+    return _get_storage_client(working_dir)
 
 
 # Create the MCP server
